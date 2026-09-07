@@ -1,0 +1,10 @@
+from enum import Enum
+
+class TaskTypeName(Enum):
+    FIX = "FIX"
+    MIGRATION = "MIGRATION"
+    ANALYSIS = "ANALYSIS"
+    IMPLEMENTATION = "IMPLEMENTATION"
+    TESTING = "TESTING"
+    DOCUMENTATION = "DOCUMENTATION"
+    UNKNOWN = "UNKNOWN"

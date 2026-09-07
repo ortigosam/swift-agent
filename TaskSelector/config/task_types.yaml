@@ -1,0 +1,21 @@
+task_types:
+  - name: FIX
+    description: "Correct an existing bug, error, crash, or unexpected behavior."
+
+  - name: MIGRATION
+    description: "Migrate existing code from one architecture, technology, API, or implementation to another."
+
+  - name: ANALYSIS
+    description: "Analyze existing code or a problem to understand its behavior, architecture, dependencies, or possible solutions."
+
+  - name: IMPLEMENTATION
+    description: "Create new functionality, code, components, or features that do not currently exist."
+
+  - name: TESTING
+    description: "Create, modify, or improve tests to verify the behavior and correctness of existing code."
+
+  - name: DOCUMENTATION
+    description: "Create or update technical documentation, explanations, or project documentation."
+
+  - name: UNKNOWN
+    description: "The task cannot be confidently classified into any known task type."

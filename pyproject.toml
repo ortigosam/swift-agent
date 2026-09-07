@@ -1,0 +1,25 @@
+[project]
+name = "firstagent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Miguel Angel Tejada Ortigosa", email = "matejada@caixabanktech.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "github-copilot-sdk>=0.1.25",
+    "langchain>=0.3.30",
+    "langchain-openai>=0.3.35",
+    "langgraph>=0.6.11",
+    "python-dotenv>=1.2.1",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-swift>=0.7.3",
+]
+
+[project.scripts]
+firstagent = "firstagent:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
