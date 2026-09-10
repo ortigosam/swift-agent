@@ -2,7 +2,7 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 RESULTS_DIR = Path("benchmark_results")
@@ -16,7 +16,7 @@ HTML = r"""<!doctype html>
   <title>Benchmark Dashboard</title>
   <style>
     :root {
-      color-scheme: light dark;
+      color-scheme: dark;
       --bg: #0d1117;
       --panel: #161b22;
       --panel-2: #21262d;
@@ -27,6 +27,11 @@ HTML = r"""<!doctype html>
       --green: #3fb950;
       --red: #f85149;
       --yellow: #d29922;
+      --purple: #a371f7;
+    }
+
+    * {
+      box-sizing: border-box;
     }
 
     body {
@@ -47,14 +52,25 @@ HTML = r"""<!doctype html>
       font-size: 28px;
     }
 
-    .subtitle {
-      color: var(--muted);
+    h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+    }
+
+    code {
+      color: #79c0ff;
     }
 
     main {
       padding: 24px;
       display: grid;
       gap: 24px;
+    }
+
+    .subtitle,
+    .small,
+    .muted {
+      color: var(--muted);
     }
 
     .controls,
@@ -83,7 +99,8 @@ HTML = r"""<!doctype html>
     }
 
     select,
-    input {
+    input,
+    button {
       background: var(--panel-2);
       color: var(--text);
       border: 1px solid var(--border);
@@ -92,9 +109,29 @@ HTML = r"""<!doctype html>
       min-width: 180px;
     }
 
+    button {
+      min-width: auto;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--accent);
+    }
+
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+    }
+
+    .checkbox-label input {
+      min-width: auto;
+    }
+
     .cards {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
       gap: 1px;
       overflow: hidden;
     }
@@ -112,32 +149,20 @@ HTML = r"""<!doctype html>
     }
 
     .card .value {
-      font-size: 28px;
+      font-size: 24px;
       font-weight: 700;
       margin-top: 6px;
     }
 
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
       gap: 24px;
     }
 
     .panel {
       padding: 18px;
       overflow: auto;
-    }
-
-    .panel h2 {
-      margin: 0 0 16px;
-      font-size: 18px;
-    }
-
-    svg {
-      width: 100%;
-      min-height: 320px;
-      background: #0d1117;
-      border-radius: 8px;
     }
 
     table {
@@ -163,6 +188,7 @@ HTML = r"""<!doctype html>
       top: 0;
       background: var(--panel);
       z-index: 1;
+      cursor: pointer;
     }
 
     tr:hover td {
@@ -171,16 +197,33 @@ HTML = r"""<!doctype html>
 
     .ok {
       color: var(--green);
-      font-weight: 600;
+      font-weight: 700;
     }
 
     .fail {
       color: var(--red);
-      font-weight: 600;
+      font-weight: 700;
+    }
+
+    .warn {
+      color: var(--yellow);
+      font-weight: 700;
+    }
+
+    .pill {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px 8px;
+      background: var(--panel-2);
     }
 
     details {
-      max-width: 900px;
+      max-width: 1100px;
+    }
+
+    summary {
+      cursor: pointer;
+      color: #79c0ff;
     }
 
     pre {
@@ -189,20 +232,33 @@ HTML = r"""<!doctype html>
       border-radius: 8px;
       padding: 12px;
       overflow: auto;
-      max-height: 420px;
+      max-height: 460px;
       white-space: pre-wrap;
+      line-height: 1.35;
     }
 
-    .small {
+    .answer {
+      max-width: 520px;
+      white-space: normal;
+    }
+
+    .negative {
+      color: var(--green);
+    }
+
+    .positive {
+      color: var(--red);
+    }
+
+    .neutral {
       color: var(--muted);
-      font-size: 12px;
     }
   </style>
 </head>
 <body>
   <header>
     <h1>Benchmark Dashboard</h1>
-    <div class="subtitle">All records loaded from <code>benchmark_results/*.jsonl</code></div>
+    <div class="subtitle">Results from <code>benchmark_results/*.jsonl</code> and logs from <code>benchmark_results/logs/*.log</code></div>
   </header>
 
   <main>
@@ -216,53 +272,126 @@ HTML = r"""<!doctype html>
         <select id="taskFilter"></select>
       </label>
       <label>
-        Search
-        <input id="searchFilter" placeholder="task, mode, answer...">
+        Result
+        <select id="passFilter">
+          <option value="">All</option>
+          <option value="pass">Passed</option>
+          <option value="fail">Failed</option>
+          <option value="parse_error">Parse errors</option>
+        </select>
       </label>
+      <label>
+        Search
+        <input id="searchFilter" placeholder="task, mode, answer, file...">
+      </label>
+      <label class="checkbox-label">
+        <input id="latestOnlyFilter" type="checkbox" checked>
+        Latest per task/mode
+      </label>
+      <button id="reloadButton" type="button">Reload</button>
     </section>
 
     <section class="cards" id="cards"></section>
 
     <section class="grid">
       <div class="panel">
-        <h2>Total tokens by record</h2>
-        <svg id="tokensChart"></svg>
+        <h2>Aggregate by mode</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Mode</th>
+              <th>Runs</th>
+              <th>Passed</th>
+              <th>Pass rate</th>
+              <th>Avg latency</th>
+              <th>Total tokens</th>
+              <th>Input</th>
+              <th>Output</th>
+              <th>Tool calls</th>
+              <th>Cost</th>
+            </tr>
+          </thead>
+          <tbody id="aggregateBody"></tbody>
+        </table>
       </div>
+
       <div class="panel">
-        <h2>Input tokens by mode</h2>
-        <svg id="modeChart"></svg>
+        <h2>Baseline vs evidence_packet</h2>
+        <div class="small">Uses the visible rows. Negative latency/token deltas mean <code>evidence_packet</code> is better.</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Baseline</th>
+              <th>Evidence</th>
+              <th>Latency delta</th>
+              <th>Token delta</th>
+              <th>Missing delta</th>
+            </tr>
+          </thead>
+          <tbody id="comparisonBody"></tbody>
+        </table>
       </div>
     </section>
 
     <section class="panel">
-      <h2>All benchmark records</h2>
-      <div class="small">Each row includes an expandable raw JSON payload, including prompts, outputs and evidence packets.</div>
+      <h2>Benchmark records</h2>
+      <div class="small">Click column headers to sort. Details include answer, evaluation, evidence packet, tool history and raw JSON.</div>
       <table>
         <thead>
           <tr>
-            <th>#</th>
-            <th>Timestamp</th>
-            <th>Mode</th>
-            <th>Task</th>
-            <th>Input</th>
-            <th>Output</th>
-            <th>Total</th>
-            <th>Tools</th>
-            <th>LLM calls</th>
-            <th>Passed</th>
-            <th>Latency</th>
-            <th>Raw</th>
+            <th data-sort="timestamp">Timestamp</th>
+            <th data-sort="source_file">Source</th>
+            <th data-sort="mode">Mode</th>
+            <th data-sort="task_id">Task</th>
+            <th data-sort="category">Category</th>
+            <th data-sort="difficulty">Difficulty</th>
+            <th data-sort="passed">Passed</th>
+            <th data-sort="status">Status</th>
+            <th data-sort="latency_ms">Latency</th>
+            <th data-sort="total_tokens">Tokens</th>
+            <th data-sort="input_tokens">Input</th>
+            <th data-sort="output_tokens">Output</th>
+            <th data-sort="tool_calls">Tools</th>
+            <th data-sort="llm_calls">LLM calls</th>
+            <th data-sort="missing_count">Missing</th>
+            <th data-sort="evidence_items">Evidence</th>
+            <th>Answer / details</th>
           </tr>
         </thead>
         <tbody id="recordsBody"></tbody>
       </table>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Benchmark log files</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Size</th>
+              <th>Modified</th>
+              <th>Preview</th>
+            </tr>
+          </thead>
+          <tbody id="logsBody"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>Selected log tail</h2>
+        <pre id="logPreview">Select a log preview.</pre>
+      </div>
     </section>
   </main>
 
   <script>
     const state = {
       records: [],
-      filtered: []
+      logs: [],
+      visible: [],
+      sortKey: "timestamp",
+      sortDirection: "desc"
     };
 
     const nf = new Intl.NumberFormat();
@@ -271,10 +400,42 @@ HTML = r"""<!doctype html>
       return Number(record?.usage?.[key] || 0);
     }
 
+    function totalTokens(record) {
+      return usage(record, "total_tokens");
+    }
+
     function llmCalls(record) {
       return Array.isArray(record.llm_invocations)
         ? record.llm_invocations.length
         : 0;
+    }
+
+    function evidenceItems(record) {
+      return Array.isArray(record?.evidence_packet?.items)
+        ? record.evidence_packet.items.length
+        : 0;
+    }
+
+    function evidenceFacts(record) {
+      return Array.isArray(record?.evidence_packet?.facts)
+        ? record.evidence_packet.facts.length
+        : 0;
+    }
+
+    function missingCount(record) {
+      const evaluation = record.evaluation || {};
+      return ["missing_mentions", "missing_files", "missing_symbols"]
+        .reduce((sum, key) => sum + (Array.isArray(evaluation[key]) ? evaluation[key].length : 0), 0);
+    }
+
+    function sortValue(record, key) {
+      if (key === "total_tokens") return totalTokens(record);
+      if (key === "input_tokens") return usage(record, "input_tokens");
+      if (key === "output_tokens") return usage(record, "output_tokens");
+      if (key === "llm_calls") return llmCalls(record);
+      if (key === "missing_count") return missingCount(record);
+      if (key === "evidence_items") return evidenceItems(record) + evidenceFacts(record);
+      return record[key];
     }
 
     function option(value, label) {
@@ -292,37 +453,82 @@ HTML = r"""<!doctype html>
       taskFilter.replaceChildren(option("", "All tasks"), ...tasks.map(v => option(v, v)));
     }
 
-    function applyFilters() {
+    function latestRecords(records) {
+      const map = new Map();
+
+      for (const record of records) {
+        if (record.parse_error) {
+          map.set(`parse:${record.source_file}:${record.source_line}`, record);
+          continue;
+        }
+
+        const key = `${record.task_id || "unknown"}|${record.mode || "unknown"}`;
+        const current = map.get(key);
+
+        if (!current || String(record.timestamp || "") >= String(current.timestamp || "")) {
+          map.set(key, record);
+        }
+      }
+
+      return [...map.values()];
+    }
+
+    function filteredRecords() {
       const mode = modeFilter.value;
       const task = taskFilter.value;
+      const pass = passFilter.value;
       const search = searchFilter.value.trim().toLowerCase();
+      const source = latestOnlyFilter.checked
+        ? latestRecords(state.records)
+        : [...state.records];
 
-      state.filtered = state.records.filter(record => {
+      return source.filter(record => {
         if (mode && record.mode !== mode) return false;
         if (task && record.task_id !== task) return false;
+        if (pass === "pass" && record.passed !== true) return false;
+        if (pass === "fail" && record.passed !== false) return false;
+        if (pass === "parse_error" && !record.parse_error) return false;
         if (!search) return true;
 
         return JSON.stringify(record).toLowerCase().includes(search);
+      });
+    }
+
+    function applyFilters() {
+      const direction = state.sortDirection === "asc" ? 1 : -1;
+      state.visible = filteredRecords().sort((a, b) => {
+        const av = sortValue(a, state.sortKey);
+        const bv = sortValue(b, state.sortKey);
+
+        if (typeof av === "number" || typeof bv === "number") {
+          return (Number(av || 0) - Number(bv || 0)) * direction;
+        }
+
+        return String(av || "").localeCompare(String(bv || "")) * direction;
       });
 
       render();
     }
 
     function renderCards() {
-      const records = state.filtered;
+      const records = state.visible.filter(r => !r.parse_error);
       const input = records.reduce((sum, r) => sum + usage(r, "input_tokens"), 0);
       const output = records.reduce((sum, r) => sum + usage(r, "output_tokens"), 0);
-      const total = records.reduce((sum, r) => sum + usage(r, "total_tokens"), 0);
+      const total = records.reduce((sum, r) => sum + totalTokens(r), 0);
       const tools = records.reduce((sum, r) => sum + Number(r.tool_calls || 0), 0);
       const passed = records.filter(r => r.passed === true).length;
+      const latency = records.reduce((sum, r) => sum + Number(r.latency_ms || 0), 0);
+      const avgLatency = records.length ? Math.round(latency / records.length) : 0;
 
       cards.innerHTML = [
-        ["Records", records.length],
+        ["Visible records", state.visible.length],
+        ["Passed", `${passed}/${records.length}`],
+        ["Pass rate", records.length ? `${((passed / records.length) * 100).toFixed(1)}%` : "0.0%"],
+        ["Avg latency", `${nf.format(avgLatency)} ms`],
+        ["Total tokens", nf.format(total)],
         ["Input tokens", nf.format(input)],
         ["Output tokens", nf.format(output)],
-        ["Total tokens", nf.format(total)],
         ["Tool calls", nf.format(tools)],
-        ["Passed", `${passed}/${records.length}`],
       ].map(([label, value]) => `
         <div class="card">
           <div class="label">${label}</div>
@@ -331,104 +537,176 @@ HTML = r"""<!doctype html>
       `).join("");
     }
 
-    function renderBarChart(svg, rows, valueFn, labelFn, colorFn) {
-      const width = 900;
-      const height = 330;
-      const margin = { top: 20, right: 20, bottom: 95, left: 70 };
-      const innerWidth = width - margin.left - margin.right;
-      const innerHeight = height - margin.top - margin.bottom;
-      const max = Math.max(1, ...rows.map(valueFn));
-      const barWidth = innerWidth / Math.max(1, rows.length);
-
-      const bars = rows.map((row, index) => {
-        const value = valueFn(row);
-        const barHeight = value / max * innerHeight;
-        const x = margin.left + index * barWidth + 2;
-        const y = margin.top + innerHeight - barHeight;
-        const label = labelFn(row);
-        const color = colorFn(row, index);
-
-        return `
-          <g>
-            <title>${label}: ${nf.format(value)}</title>
-            <rect x="${x}" y="${y}" width="${Math.max(2, barWidth - 4)}" height="${barHeight}" fill="${color}" rx="3"></rect>
-            <text x="${x + Math.max(2, barWidth - 4) / 2}" y="${height - 50}" fill="#8b949e" font-size="10" text-anchor="end" transform="rotate(-45 ${x + Math.max(2, barWidth - 4) / 2},${height - 50})">${escapeHtml(label.slice(0, 28))}</text>
-          </g>
-        `;
-      }).join("");
-
-      const grid = [0, .25, .5, .75, 1].map(t => {
-        const y = margin.top + innerHeight - t * innerHeight;
-        const label = Math.round(max * t);
-        return `
-          <line x1="${margin.left}" x2="${width - margin.right}" y1="${y}" y2="${y}" stroke="#30363d"></line>
-          <text x="${margin.left - 8}" y="${y + 4}" fill="#8b949e" font-size="11" text-anchor="end">${nf.format(label)}</text>
-        `;
-      }).join("");
-
-      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-      svg.innerHTML = `
-        ${grid}
-        ${bars}
-      `;
-    }
-
-    function renderCharts() {
-      const rows = state.filtered;
-
-      renderBarChart(
-        tokensChart,
-        rows,
-        record => usage(record, "total_tokens"),
-        record => `${record.mode}:${record.task_id}`,
-        record => record.mode === "evidence_packet" ? "#3fb950" : "#2f81f7"
-      );
-
-      const byMode = [...rows.reduce((map, record) => {
-        const key = record.mode || "unknown";
-        const current = map.get(key) || { mode: key, input: 0 };
-        current.input += usage(record, "input_tokens");
-        map.set(key, current);
+    function groupedBy(records, keyFn) {
+      return records.reduce((map, record) => {
+        const key = keyFn(record);
+        const values = map.get(key) || [];
+        values.push(record);
+        map.set(key, values);
         return map;
-      }, new Map()).values()];
-
-      renderBarChart(
-        modeChart,
-        byMode,
-        row => row.input,
-        row => row.mode,
-        (_, index) => ["#2f81f7", "#3fb950", "#d29922", "#a371f7"][index % 4]
-      );
+      }, new Map());
     }
 
-    function renderTable() {
-      recordsBody.innerHTML = state.filtered.map((record, index) => `
+    function renderAggregate() {
+      const rows = [...groupedBy(
+        state.visible.filter(r => !r.parse_error),
+        r => r.mode || "unknown"
+      ).entries()].sort(([a], [b]) => a.localeCompare(b));
+
+      aggregateBody.innerHTML = rows.map(([mode, records]) => {
+        const runs = records.length;
+        const passed = records.filter(r => r.passed === true).length;
+        const latency = records.reduce((sum, r) => sum + Number(r.latency_ms || 0), 0);
+        const cost = records.reduce((sum, r) => sum + Number(r?.usage?.cost || 0), 0);
+        const tools = records.reduce((sum, r) => sum + Number(r.tool_calls || 0), 0);
+
+        return `
+          <tr>
+            <td><span class="pill">${escapeHtml(mode)}</span></td>
+            <td>${runs}</td>
+            <td class="${passed === runs ? "ok" : "warn"}">${passed}/${runs}</td>
+            <td>${runs ? ((passed / runs) * 100).toFixed(1) : "0.0"}%</td>
+            <td>${nf.format(Math.round(latency / Math.max(1, runs)))} ms</td>
+            <td>${nf.format(records.reduce((sum, r) => sum + totalTokens(r), 0))}</td>
+            <td>${nf.format(records.reduce((sum, r) => sum + usage(r, "input_tokens"), 0))}</td>
+            <td>${nf.format(records.reduce((sum, r) => sum + usage(r, "output_tokens"), 0))}</td>
+            <td>${nf.format(tools)}</td>
+            <td>${cost.toFixed(4)}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function renderComparison() {
+      const records = state.visible.filter(r => !r.parse_error);
+      const byTask = groupedBy(records, r => r.task_id || "unknown");
+      const rows = [];
+
+      for (const [task, taskRecords] of byTask.entries()) {
+        const baseline = taskRecords.find(r => r.mode === "baseline");
+        const evidence = taskRecords.find(r => r.mode === "evidence_packet");
+
+        if (!baseline || !evidence) continue;
+
+        rows.push({ task, baseline, evidence });
+      }
+
+      comparisonBody.innerHTML = rows.sort((a, b) => a.task.localeCompare(b.task)).map(row => {
+        const latencyDelta = Number(row.evidence.latency_ms || 0) - Number(row.baseline.latency_ms || 0);
+        const tokenDelta = totalTokens(row.evidence) - totalTokens(row.baseline);
+        const missingDelta = missingCount(row.evidence) - missingCount(row.baseline);
+
+        return `
+          <tr>
+            <td>${escapeHtml(row.task)}</td>
+            <td class="${row.baseline.passed ? "ok" : "fail"}">${row.baseline.passed ? "pass" : "fail"}</td>
+            <td class="${row.evidence.passed ? "ok" : "fail"}">${row.evidence.passed ? "pass" : "fail"}</td>
+            <td class="${deltaClass(latencyDelta)}">${formatDelta(latencyDelta)} ms</td>
+            <td class="${deltaClass(tokenDelta)}">${formatDelta(tokenDelta)}</td>
+            <td class="${deltaClass(missingDelta)}">${formatDelta(missingDelta)}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function renderRecords() {
+      recordsBody.innerHTML = state.visible.map(record => {
+        if (record.parse_error) {
+          return `
+            <tr>
+              <td></td>
+              <td>${escapeHtml(record.source_file || "")}:${record.source_line || ""}</td>
+              <td colspan="14" class="fail">Parse error: ${escapeHtml(record.parse_error)}</td>
+              <td><pre>${escapeHtml(record.raw_line || "")}</pre></td>
+            </tr>
+          `;
+        }
+
+        const missing = missingCount(record);
+        const evidence = `${evidenceItems(record)} items / ${evidenceFacts(record)} facts`;
+
+        return `
+          <tr>
+            <td>${escapeHtml(record.timestamp || "")}</td>
+            <td>${escapeHtml(shortSource(record))}</td>
+            <td><span class="pill">${escapeHtml(record.mode || "")}</span></td>
+            <td>${escapeHtml(record.task_id || "")}</td>
+            <td>${escapeHtml(record.category || "")}</td>
+            <td>${escapeHtml(record.difficulty || "")}</td>
+            <td class="${record.passed ? "ok" : "fail"}">${record.passed === true ? "pass" : "fail"}</td>
+            <td>${escapeHtml(record.status || "")}</td>
+            <td>${nf.format(Number(record.latency_ms || 0))} ms</td>
+            <td>${nf.format(totalTokens(record))}</td>
+            <td>${nf.format(usage(record, "input_tokens"))}</td>
+            <td>${nf.format(usage(record, "output_tokens"))}</td>
+            <td>${nf.format(Number(record.tool_calls || 0))}</td>
+            <td>${nf.format(llmCalls(record))}</td>
+            <td class="${missing ? "fail" : "ok"}">${missing}</td>
+            <td>${evidence}</td>
+            <td class="answer">
+              <details>
+                <summary>${escapeHtml(answerPreview(record.answer || ""))}</summary>
+                <h3>Answer</h3>
+                <pre>${escapeHtml(record.answer || "")}</pre>
+                <h3>Evaluation</h3>
+                <pre>${escapeHtml(JSON.stringify(record.evaluation || {}, null, 2))}</pre>
+                <h3>Expected</h3>
+                <pre>${escapeHtml(JSON.stringify(record.expected || {}, null, 2))}</pre>
+                <h3>Evidence packet</h3>
+                <pre>${escapeHtml(JSON.stringify(record.evidence_packet || null, null, 2))}</pre>
+                <h3>Tool history</h3>
+                <pre>${escapeHtml(JSON.stringify(record.tool_history || [], null, 2))}</pre>
+                <h3>Raw JSON</h3>
+                <pre>${escapeHtml(JSON.stringify(record, null, 2))}</pre>
+              </details>
+            </td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function renderLogs() {
+      logsBody.innerHTML = state.logs.map(log => `
         <tr>
-          <td>${index + 1}</td>
-          <td>${escapeHtml(record.timestamp || "")}</td>
-          <td>${escapeHtml(record.mode || "")}</td>
-          <td>${escapeHtml(record.task_id || "")}</td>
-          <td>${nf.format(usage(record, "input_tokens"))}</td>
-          <td>${nf.format(usage(record, "output_tokens"))}</td>
-          <td>${nf.format(usage(record, "total_tokens"))}</td>
-          <td>${nf.format(Number(record.tool_calls || 0))}</td>
-          <td>${nf.format(llmCalls(record))}</td>
-          <td class="${record.passed ? "ok" : "fail"}">${record.passed === true ? "true" : "false"}</td>
-          <td>${nf.format(Number(record.latency_ms || 0))} ms</td>
-          <td>
-            <details>
-              <summary>JSON</summary>
-              <pre>${escapeHtml(JSON.stringify(record, null, 2))}</pre>
-            </details>
-          </td>
+          <td>${escapeHtml(log.name)}</td>
+          <td>${nf.format(log.size_bytes)} bytes</td>
+          <td>${escapeHtml(log.modified_at)}</td>
+          <td><button type="button" data-log="${escapeHtml(log.name)}">Show tail</button></td>
         </tr>
       `).join("");
+
+      logsBody.querySelectorAll("button[data-log]").forEach(button => {
+        button.addEventListener("click", () => loadLogTail(button.dataset.log));
+      });
     }
 
     function render() {
       renderCards();
-      renderCharts();
-      renderTable();
+      renderAggregate();
+      renderComparison();
+      renderRecords();
+      renderLogs();
+    }
+
+    function formatDelta(value) {
+      return `${value >= 0 ? "+" : ""}${nf.format(value)}`;
+    }
+
+    function deltaClass(value) {
+      if (value < 0) return "negative";
+      if (value > 0) return "positive";
+      return "neutral";
+    }
+
+    function shortSource(record) {
+      const file = record.source_file || "";
+      const line = record.source_line || "";
+      return `${file.replace(/^.*benchmark_results\//, "")}${line ? ":" + line : ""}`;
+    }
+
+    function answerPreview(answer) {
+      const compact = String(answer || "").replace(/\s+/g, " ").trim();
+      return compact ? compact.slice(0, 90) : "Details";
     }
 
     function escapeHtml(value) {
@@ -440,18 +718,48 @@ HTML = r"""<!doctype html>
         .replaceAll("'", "&#039;");
     }
 
-    async function load() {
-      const response = await fetch("/api/results");
+    async function loadLogTail(name) {
+      const response = await fetch(`/api/log-tail?name=${encodeURIComponent(name)}&lines=240`);
       const payload = await response.json();
-      state.records = payload.records || [];
-      state.filtered = state.records;
+      logPreview.textContent = payload.content || payload.error || "No log content.";
+    }
+
+    async function load() {
+      const [resultsResponse, logsResponse] = await Promise.all([
+        fetch("/api/results"),
+        fetch("/api/logs")
+      ]);
+      const resultsPayload = await resultsResponse.json();
+      const logsPayload = await logsResponse.json();
+      state.records = resultsPayload.records || [];
+      state.logs = logsPayload.logs || [];
       fillFilters();
-      render();
+      applyFilters();
+
+      if (state.logs[0]) {
+        await loadLogTail(state.logs[0].name);
+      }
     }
 
     modeFilter.addEventListener("change", applyFilters);
     taskFilter.addEventListener("change", applyFilters);
+    passFilter.addEventListener("change", applyFilters);
     searchFilter.addEventListener("input", applyFilters);
+    latestOnlyFilter.addEventListener("change", applyFilters);
+    reloadButton.addEventListener("click", load);
+
+    document.querySelectorAll("th[data-sort]").forEach(th => {
+      th.addEventListener("click", () => {
+        const key = th.dataset.sort;
+        if (state.sortKey === key) {
+          state.sortDirection = state.sortDirection === "asc" ? "desc" : "asc";
+        } else {
+          state.sortKey = key;
+          state.sortDirection = "asc";
+        }
+        applyFilters();
+      });
+    });
 
     load().catch(error => {
       document.body.innerHTML = `<pre>${escapeHtml(error.stack || error)}</pre>`;
@@ -496,6 +804,49 @@ def load_records() -> list[dict]:
     return records
 
 
+def load_logs() -> list[dict]:
+    logs_dir = RESULTS_DIR / "logs"
+
+    if not logs_dir.exists():
+        return []
+
+    logs = []
+
+    for path in sorted(
+        logs_dir.glob("*.log"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    ):
+        stat = path.stat()
+        logs.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "size_bytes": stat.st_size,
+                "modified_at": stat.st_mtime,
+            }
+        )
+
+    return logs
+
+
+def read_log_tail(
+    name: str,
+    lines: int,
+) -> str:
+    logs_dir = (RESULTS_DIR / "logs").resolve()
+    path = (logs_dir / name).resolve()
+
+    if logs_dir not in path.parents or path.suffix != ".log":
+        raise ValueError("Invalid log path.")
+
+    if not path.exists():
+        raise FileNotFoundError(name)
+
+    with path.open("r", encoding="utf-8", errors="replace") as file:
+        return "".join(file.readlines()[-lines:])
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
@@ -508,17 +859,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if parsed.path == "/api/results":
-            body = json.dumps(
-                {
-                    "records": load_records(),
-                },
-                ensure_ascii=False,
-                default=str,
-            ).encode("utf-8")
+        if parsed.path in {
+            "/api/results",
+            "/api/logs",
+            "/api/log-tail",
+        }:
             self._send_headers(
                 content_type="application/json; charset=utf-8",
-                content_length=len(body),
+                content_length=0,
             )
             return
 
@@ -539,10 +887,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if parsed.path == "/api/logs":
+            self._send_json(
+                {
+                    "logs": load_logs(),
+                }
+            )
+            return
+
+        if parsed.path == "/api/log-tail":
+            self._send_log_tail(parsed.query)
+            return
+
         self.send_error(404)
 
     def log_message(self, format, *args):
         return
+
+    def _send_log_tail(
+        self,
+        query: str,
+    ):
+        params = parse_qs(query)
+        name = params.get("name", [""])[0]
+        lines = int(params.get("lines", ["240"])[0])
+
+        try:
+            content = read_log_tail(
+                name=name,
+                lines=max(
+                    1,
+                    min(
+                        lines,
+                        2000,
+                    ),
+                ),
+            )
+        except (FileNotFoundError, ValueError) as error:
+            self._send_json(
+                {
+                    "error": str(error),
+                }
+            )
+            return
+
+        self._send_json(
+            {
+                "name": name,
+                "content": content,
+            }
+        )
 
     def _send_html(self, content: str):
         body = content.encode("utf-8")
@@ -579,10 +973,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global RESULTS_DIR
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument(
+        "--results-dir",
+        default=str(RESULTS_DIR),
+        help="Directory containing benchmark JSONL files and logs/.",
+    )
     args = parser.parse_args()
+
+    RESULTS_DIR = Path(args.results_dir)
 
     server = ThreadingHTTPServer(
         (args.host, args.port),
@@ -593,6 +996,7 @@ def main():
         "Benchmark dashboard running at "
         f"http://{args.host}:{args.port}"
     )
+    print(f"Reading benchmark data from {RESULTS_DIR.resolve()}")
 
     try:
         server.serve_forever()

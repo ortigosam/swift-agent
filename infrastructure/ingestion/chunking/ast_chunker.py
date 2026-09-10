@@ -1,3 +1,5 @@
+import re
+
 from tree_sitter import Node
 
 from infrastructure.ingestion.chunking.code_chunk import (
@@ -21,7 +23,6 @@ class ASTChunker:
         "extension_declaration",
         "function_declaration",
         "init_declaration",
-        "protocol_function_declaration",
     }
 
     def __init__(
@@ -49,6 +50,7 @@ class ASTChunker:
             source_path=source_path,
             module=module,
         )
+        line_count = len(source.splitlines())
 
         chunks: list[CodeChunk] = []
 
@@ -58,6 +60,7 @@ class ASTChunker:
             chunks=chunks,
             symbol_stack=[],
             file_context=file_context,
+            line_count=line_count,
         )
 
         return chunks
@@ -73,9 +76,27 @@ class ASTChunker:
         chunks: list[CodeChunk],
         symbol_stack: list[str],
         file_context: FileContext,
+        line_count: int,
     ) -> None:
 
         if node.type in self.CHUNKABLE_NODES:
+            start_row = int(node.start_point.row)
+            end_row = int(node.end_point.row)
+
+            if not (
+                0 <= start_row <= end_row <= line_count
+            ):
+                for child in node.children:
+                    self._visit(
+                        node=child,
+                        source_bytes=source_bytes,
+                        chunks=chunks,
+                        symbol_stack=symbol_stack,
+                        file_context=file_context,
+                        line_count=line_count,
+                    )
+
+                return
 
             chunk = self._create_chunk(
                 node=node,
@@ -101,6 +122,7 @@ class ASTChunker:
                     chunks=chunks,
                     symbol_stack=next_symbol_stack,
                     file_context=file_context,
+                    line_count=line_count,
                 )
 
             return
@@ -112,6 +134,7 @@ class ASTChunker:
                 chunks=chunks,
                 symbol_stack=symbol_stack,
                 file_context=file_context,
+                line_count=line_count,
             )
 
     # ------------------------------------------------------------------
@@ -164,11 +187,48 @@ class ASTChunker:
             language="swift",
             symbol=symbol,
             qualified_symbol=qualified_symbol,
-            symbol_type=node.type,
+            symbol_type=self._symbol_type(
+                node=node,
+                content=content,
+            ),
             parent_symbol=parent_symbol,
             signature=signature,
             metadata=metadata,
         )
+
+    def _symbol_type(
+        self,
+        node: Node,
+        content: str,
+    ) -> str:
+
+        if node.type != "class_declaration":
+            return node.type
+
+        declaration_keyword = self._declaration_keyword(content)
+
+        if declaration_keyword in {
+            "class",
+            "struct",
+        }:
+            return f"{declaration_keyword}_declaration"
+
+        return node.type
+
+    def _declaration_keyword(
+        self,
+        content: str,
+    ) -> str | None:
+
+        match = re.search(
+            r"\b(class|struct)\b",
+            content,
+        )
+
+        if match is None:
+            return None
+
+        return match.group(1)
 
     # ------------------------------------------------------------------
     # Source extraction
@@ -180,9 +240,58 @@ class ASTChunker:
         source_bytes: bytes,
     ) -> str:
 
+        lines = source_bytes.splitlines(
+            keepends=True,
+        )
+
+        if not self._has_valid_line_range(
+            node=node,
+            line_count=len(lines),
+        ):
+            return ""
+
+        start_offset = self._offset_for_point(
+            lines=lines,
+            row=node.start_point.row,
+            column=node.start_point.column,
+        )
+        end_offset = self._offset_for_point(
+            lines=lines,
+            row=node.end_point.row,
+            column=node.end_point.column,
+        )
+
         return source_bytes[
-            node.start_byte:node.end_byte
+            start_offset:end_offset
         ].decode("utf-8")
+
+    def _has_valid_line_range(
+        self,
+        node: Node,
+        line_count: int,
+    ) -> bool:
+
+        start_row = int(node.start_point.row)
+        end_row = int(node.end_point.row)
+
+        return (
+            0 <= start_row <= end_row <= line_count
+        )
+
+    def _offset_for_point(
+        self,
+        lines: list[bytes],
+        row: int,
+        column: int,
+    ) -> int:
+
+        if row >= len(lines):
+            return sum(len(line) for line in lines)
+
+        return sum(
+            len(line)
+            for line in lines[:row]
+        ) + column
 
     # ------------------------------------------------------------------
     # Symbols

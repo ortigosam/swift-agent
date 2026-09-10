@@ -9,10 +9,12 @@ from domain.tools.search_result import SearchResult
 IGNORED_DIRECTORIES = {
     ".git",
     ".venv",
+    ".build",
     "__pycache__",
     "benchmark_results",
     "build",
     "dist",
+    "Pods",
 }
 
 SUPPORTED_EXTENSIONS = {

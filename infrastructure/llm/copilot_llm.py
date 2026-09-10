@@ -11,11 +11,22 @@ class CopilotLLM:
 
     def __init__(
         self,
-        model: str = "gpt-5.4",
+        model: str = "gpt-5-mini",
         tools: list | None = None,
+        timeout_seconds: float | None = None,
     ):
         self.model = model
         self.tools = tools or []
+        self.timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else float(
+                os.environ.get(
+                    "COPILOT_LLM_TIMEOUT_SECONDS",
+                    "300",
+                )
+            )
+        )
 
         self.github_token = (
             os.environ.get("COPILOT_SDK_AUTH_TOKEN")
@@ -169,7 +180,8 @@ class CopilotLLM:
         usage_before = self.get_usage()
 
         response = await self.session.send_and_wait(
-            prompt
+            prompt,
+            timeout=self.timeout_seconds,
         )
 
         tool_calls = list(

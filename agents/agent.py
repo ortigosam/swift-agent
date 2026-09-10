@@ -5,19 +5,22 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from domain.agent_state import AgentState
 from domain.agent_status import AgentStatus
-
+from context.context_manager import ContextManager
+from domain.context import AgentContext
 
 class Agent:
 
     def __init__(
         self,
         llm,
-        context_manager,
+        context_manager: ContextManager,
         system_prompt: str,
+        indexed_evidence: str | None = None,
     ):
         self.llm = llm
         self.context_manager = context_manager
         self.system_prompt = system_prompt
+        self.indexed_evidence = indexed_evidence
 
     async def run(self, state: AgentState):
 
@@ -25,68 +28,7 @@ class Agent:
 
         context = await self.context_manager.build(state)
 
-        skills = "\n".join(
-            f"- {skill}"
-            for skill in context.skills
-        )
-
-        rules = "\n".join(
-            f"- {rule}"
-            for rule in context.rules
-        )
-
-        rag = "\n".join(
-            f"- {result.content}"
-            for result in context.rag_results
-        ) 
-
-        tools = "\n".join(
-            f"- {tool.name}"
-            for tool in context.tools
-        )
-
-        tool_history = self._compact_tool_history(
-            context.tool_history
-        )
-
-        prompt = f"""
-{self.system_prompt}
-
-## Task
-
-{context.task}
-
-## Skills
-
-{skills}
-
-## Rules
-
-{rules}
-
-## Available repository tools
-
-{tools}
-
-## Retrieved knowledge
-
-{rag}
-
-## Previous verification feedback
-
-{context.verification_feedback}
-
-## Tool history
-
-{tool_history}
-
-IMPORTANT:
-
-Use only the repository tools listed above when repository
-evidence is required.
-
-Do not guess when the repository can be inspected.
-"""
+        prompt = self._create_prompt(context=context)
 
         response = await self.llm.invoke(prompt)
 
@@ -131,7 +73,7 @@ Do not guess when the repository can be inspected.
         ]
 
         return {
-            "status": AgentStatus.RUNNING,
+            "status": AgentStatus.COMPLETED,
             "iteration": iteration,
             "messages": messages,
             "tool_calls": (
@@ -173,3 +115,68 @@ Do not guess when the repository can be inspected.
             )
 
         return "\n\n".join(lines)
+
+    def _create_prompt(self, context: AgentContext) -> str:
+        skills = "\n".join(
+            f"- {skill}"
+            for skill in context.skills
+        )
+
+        rules = "\n".join(
+            f"- {rule}"
+            for rule in context.rules
+        )
+
+        indexed_evidence = (
+            self.indexed_evidence
+            or "No pre-retrieved repository evidence."
+        )
+
+        tools = "\n".join(
+            f"- {tool.name}"
+            for tool in context.tools
+        )
+
+        tool_history = self._compact_tool_history(
+            context.tool_history
+        )
+
+        prompt = f"""
+{self.system_prompt}
+
+## Task
+
+{context.task}
+
+## Skills
+
+{skills}
+
+## Rules
+
+{rules}
+
+## Available repository tools
+
+{tools}
+
+## Indexed repository evidence
+
+{indexed_evidence}
+
+## Previous verification feedback
+
+{context.verification_feedback}
+
+## Tool history
+
+{tool_history}
+
+IMPORTANT:
+
+Use only the repository tools listed above when repository
+evidence is required.
+
+Do not guess when the repository can be inspected.
+"""
+        return prompt

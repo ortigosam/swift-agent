@@ -9,16 +9,20 @@ from graph.verify import Verify
 def create_agent_graph(
     llm,
     tools,
+    indexed_evidence: str | None = None,
     enable_verification: bool = True,
 ):
 
     agent = Agent(
         llm=llm,
-        context_manager=ContextManager(tools=tools),
+        context_manager=ContextManager(
+            tools=tools,
+        ),
         system_prompt=(
             "You are a iOS software engineering agent. "
             "Analyze the task and provide a useful response."
         ),
+        indexed_evidence=indexed_evidence,
     )
 
     builder = StateGraph(AgentState)

@@ -46,4 +46,22 @@ class ToolSelector:
                 ):
                     selected.append(tool)
 
+            if tool.name == "retrieve_evidence":
+                if any(
+                    keyword in task_lower
+                    for keyword in [
+                        "analyze",
+                        "depend",
+                        "dependency",
+                        "explain",
+                        "find",
+                        "flow",
+                        "implementation",
+                        "locate",
+                        "trace",
+                        "where",
+                    ]
+                ):
+                    selected.append(tool)
+
         return selected

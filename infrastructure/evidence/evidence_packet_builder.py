@@ -49,6 +49,105 @@ STOP_WORDS = {
     "obtaining",
 }
 
+FLOW_KEYWORDS = {
+    "before",
+    "dispatch",
+    "dispatching",
+    "flow",
+    "handled",
+    "handler",
+    "happens",
+    "starts",
+    "when",
+}
+
+DOMAIN_TERM_EXPANSIONS = {
+    "authentication": {
+        "auth",
+        "authenticated",
+        "authenticationrequired",
+        "guard",
+        "isloggedin",
+        "login",
+    },
+    "deeplink": {
+        "deep",
+        "deeplink",
+        "deeplinks",
+        "deeplinkhandler",
+        "deeplinkauthguard",
+        "handledeeplink",
+        "initializer",
+        "matcher",
+        "route",
+        "url",
+    },
+    "deeplinks": {
+        "deep",
+        "deeplink",
+        "deeplinks",
+        "deeplinkhandler",
+        "deeplinkauthguard",
+        "handledeeplink",
+        "initializer",
+        "matcher",
+        "route",
+        "url",
+    },
+    "dispatching": {
+        "dispatch",
+        "handle",
+        "handler",
+        "navigate",
+        "router",
+    },
+    "flow": {
+        "coordinator",
+        "flow",
+        "start",
+        "state",
+        "transition",
+    },
+    "handled": {
+        "dispatch",
+        "handle",
+        "handler",
+        "navigate",
+        "router",
+    },
+    "login": {
+        "auth",
+        "login",
+        "postlogin",
+        "session",
+    },
+    "post": {
+        "post",
+        "postlogin",
+    },
+    "starts": {
+        "start",
+        "starts",
+        "transition",
+    },
+}
+
+FLOW_PATH_PARTS = {
+    "assembler",
+    "authguard",
+    "coordinator",
+    "deeplink",
+    "deeplinks",
+    "environment",
+    "guard",
+    "handler",
+    "initializer",
+    "inactivity",
+    "navigation",
+    "router",
+    "scenedelegate",
+}
+
 
 class EvidencePacketBuilder:
 
@@ -81,12 +180,17 @@ class EvidencePacketBuilder:
                 self._score(
                     chunk=chunk,
                     terms=terms,
+                    intent=intent,
                 ),
                 chunk,
             )
             for chunk in chunks
         ]
 
+        chunk_candidate_limit = max(
+            self.top_k * 6,
+            30,
+        )
         best_chunks = [
             chunk
             for score, chunk in sorted(
@@ -99,8 +203,12 @@ class EvidencePacketBuilder:
                 reverse=True,
             )
             if score > 0
-        ][: self.top_k]
+        ][:chunk_candidate_limit]
 
+        fact_candidate_limit = max(
+            self.top_facts * 6,
+            30,
+        )
         best_facts = [
             self._with_fact_score(
                 fact=fact,
@@ -112,6 +220,7 @@ class EvidencePacketBuilder:
                         self._score_fact(
                             fact=fact,
                             terms=terms,
+                            intent=intent,
                         ),
                         fact,
                     )
@@ -121,7 +230,7 @@ class EvidencePacketBuilder:
                 reverse=True,
             )
             if score > 0
-        ][: self.top_facts]
+        ][:fact_candidate_limit]
 
         best_facts = self._select_facts_for_intent(
             intent=intent,
@@ -144,6 +253,7 @@ class EvidencePacketBuilder:
                     score=self._score(
                         chunk=chunk,
                         terms=terms,
+                        intent=intent,
                     ),
                 )
                 for chunk in best_chunks
@@ -156,6 +266,9 @@ class EvidencePacketBuilder:
     ) -> str:
 
         query_lower = query.lower()
+
+        if self._is_flow_query(query_lower):
+            return "flow_tracing"
 
         if any(
             keyword in query_lower
@@ -193,6 +306,27 @@ class EvidencePacketBuilder:
 
         return "general"
 
+    def _is_flow_query(
+        self,
+        query_lower: str,
+    ) -> bool:
+
+        if any(
+            keyword in query_lower
+            for keyword in FLOW_KEYWORDS
+        ):
+            return True
+
+        return any(
+            keyword in query_lower
+            for keyword in [
+                "post-login",
+                "post login",
+                "deeplink",
+                "deep link",
+            ]
+        )
+
     def _query_terms(
         self,
         query: str,
@@ -219,12 +353,38 @@ class EvidencePacketBuilder:
                 if part_lower not in STOP_WORDS:
                     terms.add(part_lower)
 
+        self._expand_query_terms(terms)
+
         return terms
+
+    def _expand_query_terms(
+        self,
+        terms: set[str],
+    ) -> None:
+
+        expanded = set()
+
+        for term in terms:
+            expanded.update(
+                DOMAIN_TERM_EXPANSIONS.get(
+                    term,
+                    set(),
+                )
+            )
+
+        if {
+            "post",
+            "login",
+        }.issubset(terms):
+            expanded.add("postlogin")
+
+        terms.update(expanded)
 
     def _score(
         self,
         chunk: CodeChunk,
         terms: set[str],
+        intent: str = "general",
     ) -> int:
 
         searchable = " ".join(
@@ -269,6 +429,82 @@ class EvidencePacketBuilder:
         if chunk.symbol_type != "line":
             score += 1
 
+        if intent == "flow_tracing":
+            score += self._flow_chunk_boost(
+                chunk=chunk,
+                terms=terms,
+                searchable=searchable,
+            )
+
+        score -= self._path_penalty(chunk.source)
+
+        return score
+
+    def _flow_chunk_boost(
+        self,
+        chunk: CodeChunk,
+        terms: set[str],
+        searchable: str,
+    ) -> int:
+
+        score = 0
+        path_parts = self._path_parts(chunk.source)
+        symbol = (
+            chunk.qualified_symbol
+            or chunk.symbol
+            or ""
+        ).lower()
+
+        if path_parts & FLOW_PATH_PARTS:
+            score += 8
+
+        if chunk.symbol_type in {
+            "function_declaration",
+            "init_declaration",
+        }:
+            score += 4
+
+        if chunk.symbol_type == "file" and any(
+            term in searchable
+            for term in terms
+            if len(term) >= 6
+        ):
+            score += 8
+
+        if any(
+            word in symbol
+            for word in [
+                "handle",
+                "start",
+                "transition",
+                "navigate",
+                "dispatch",
+            ]
+        ):
+            score += 10
+
+        if "deeplink" in terms and any(
+            word in searchable
+            for word in [
+                "handledeeplink",
+                "deeplinkauthguard",
+                "authenticationrequired",
+                "pendingdeeplink",
+            ]
+        ):
+            score += 15
+
+        if "postlogin" in terms and any(
+            word in searchable
+            for word in [
+                "postlogin",
+                "pendingdeeplink",
+                "navigatetotabbar",
+                "inactivitymanager",
+            ]
+        ):
+            score += 15
+
         return score
 
     def _symbol_priority(
@@ -308,6 +544,26 @@ class EvidencePacketBuilder:
         facts: list[EvidenceFact],
         terms: set[str],
     ) -> list[EvidenceFact]:
+
+        if intent == "flow_tracing":
+            flow_facts = [
+                fact
+                for fact in facts
+                if (
+                    fact.kind
+                    in {
+                        "calls",
+                        "depends_on",
+                        "inherits_or_conforms",
+                    }
+                    and self._fact_matches_long_term(
+                        fact=fact,
+                        terms=terms,
+                    )
+                )
+            ]
+
+            return flow_facts[: self.top_facts]
 
         if intent == "dependency":
             dependency_facts = [
@@ -370,10 +626,14 @@ class EvidencePacketBuilder:
         terms: set[str],
     ) -> list[CodeChunk]:
 
-        if intent in {
-            "dependency",
-            "responsibility",
-        } and facts:
+        if intent == "flow_tracing":
+            return self._select_flow_chunks(
+                chunks=chunks,
+                facts=facts,
+                terms=terms,
+            )
+
+        if intent == "responsibility" and facts:
             return []
 
         if intent == "method_explanation":
@@ -391,7 +651,9 @@ class EvidencePacketBuilder:
             ]
 
             if implementation_chunks:
-                return implementation_chunks[:1]
+                return implementation_chunks[
+                    : self.top_k
+                ]
 
         if intent == "implementation":
             implementation_chunks = [
@@ -402,6 +664,8 @@ class EvidencePacketBuilder:
                     in {
                         "ClassDef",
                         "class_declaration",
+                        "struct_declaration",
+                        "enum_declaration",
                         "protocol_declaration",
                     }
                     and self._chunk_matches_fact_entities(
@@ -415,7 +679,118 @@ class EvidencePacketBuilder:
                 implementation_chunks[:3]
             )
 
-        return chunks[:3]
+        return self._diversify_chunks(
+            chunks,
+            limit=min(
+                self.top_k,
+                3,
+            ),
+        )
+
+    def _select_flow_chunks(
+        self,
+        chunks: list[CodeChunk],
+        facts: list[EvidenceFact],
+        terms: set[str],
+    ) -> list[CodeChunk]:
+
+        fact_files = {
+            fact.file
+            for fact in facts
+        }
+        flow_chunks = [
+            chunk
+            for chunk in chunks
+            if (
+                chunk.source in fact_files
+                or self._chunk_matches_fact_entities(
+                    chunk=chunk,
+                    facts=facts,
+                )
+                or self._is_flow_chunk(
+                    chunk=chunk,
+                    terms=terms,
+                )
+            )
+        ]
+
+        selected = self._diversify_chunks(
+            flow_chunks or chunks,
+            limit=self.top_k,
+        )
+
+        return selected
+
+    def _is_flow_chunk(
+        self,
+        chunk: CodeChunk,
+        terms: set[str],
+    ) -> bool:
+
+        searchable = " ".join(
+            value
+            for value in [
+                chunk.source,
+                chunk.symbol or "",
+                chunk.qualified_symbol or "",
+                chunk.content,
+            ]
+            if value
+        ).lower()
+
+        if self._path_parts(chunk.source) & FLOW_PATH_PARTS:
+            return True
+
+        if "deeplink" in terms and any(
+            value in searchable
+            for value in [
+                "handledeeplink",
+                "deeplinkauthguard",
+                "authenticationrequired",
+                "pendingdeeplink",
+            ]
+        ):
+            return True
+
+        if "postlogin" in terms and any(
+            value in searchable
+            for value in [
+                "postlogin",
+                "pendingdeeplink",
+                "navigatetotabbar",
+                "inactivitymanager",
+            ]
+        ):
+            return True
+
+        return False
+
+    def _diversify_chunks(
+        self,
+        chunks: list[CodeChunk],
+        limit: int,
+        max_per_file: int = 2,
+    ) -> list[CodeChunk]:
+
+        selected = []
+        count_by_file: dict[str, int] = {}
+
+        for chunk in self._deduplicate_chunks(chunks):
+            file_count = count_by_file.get(
+                chunk.source,
+                0,
+            )
+
+            if file_count >= max_per_file:
+                continue
+
+            selected.append(chunk)
+            count_by_file[chunk.source] = file_count + 1
+
+            if len(selected) >= limit:
+                return selected
+
+        return selected
 
     def _fact_object_matches_terms(
         self,
@@ -520,6 +895,7 @@ class EvidencePacketBuilder:
         self,
         fact: EvidenceFact,
         terms: set[str],
+        intent: str = "general",
     ) -> int:
 
         searchable = " ".join(
@@ -559,7 +935,86 @@ class EvidencePacketBuilder:
         }:
             score += 2
 
+        if intent == "flow_tracing":
+            score += self._flow_fact_boost(
+                fact=fact,
+                terms=terms,
+                searchable=searchable,
+            )
+
+        score -= self._path_penalty(fact.file)
+
         return score
+
+    def _flow_fact_boost(
+        self,
+        fact: EvidenceFact,
+        terms: set[str],
+        searchable: str,
+    ) -> int:
+
+        score = 0
+
+        if self._path_parts(fact.file) & FLOW_PATH_PARTS:
+            score += 8
+
+        if fact.kind == "calls":
+            score += 6
+
+        if "deeplink" in terms and any(
+            word in searchable
+            for word in [
+                "handledeeplink",
+                "deeplinkauthguard",
+                "authenticationrequired",
+                "pendingdeeplink",
+            ]
+        ):
+            score += 15
+
+        if "postlogin" in terms and any(
+            word in searchable
+            for word in [
+                "postlogin",
+                "pendingdeeplink",
+                "navigatetotabbar",
+                "inactivitymanager",
+            ]
+        ):
+            score += 15
+
+        return score
+
+    def _path_penalty(
+        self,
+        path: str,
+    ) -> int:
+
+        parts = self._path_parts(path)
+
+        if any(
+            part in {
+                "tests",
+                "__tests__",
+                "pods",
+                ".build",
+            }
+            or part.endswith("tests")
+            for part in parts
+        ):
+            return 25
+
+        return 0
+
+    def _path_parts(
+        self,
+        path: str,
+    ) -> set[str]:
+
+        return {
+            part.lower()
+            for part in Path(path).parts
+        }
 
     def _with_fact_score(
         self,
