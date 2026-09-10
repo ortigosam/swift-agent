@@ -112,7 +112,16 @@ class ASTChunker:
             if chunk.symbol:
                 next_symbol_stack = [
                     *symbol_stack,
-                    chunk.symbol,
+                    (
+                        chunk.qualified_symbol
+                        if (
+                            chunk.qualified_symbol
+                            and chunk.qualified_symbol.startswith(
+                                "extension "
+                            )
+                        )
+                        else chunk.symbol
+                    ),
                 ]
 
             for child in node.children:
@@ -160,7 +169,10 @@ class ASTChunker:
         )
 
         qualified_symbol = self._build_qualified_symbol(
-            symbol=symbol,
+            symbol=self._context_symbol(
+                node=node,
+                symbol=symbol,
+            ),
             symbol_stack=symbol_stack,
         )
 
@@ -172,12 +184,29 @@ class ASTChunker:
             node=node,
             source_bytes=source_bytes,
         )
+        symbol_type = self._symbol_type(
+            node=node,
+            content=content,
+        )
 
         metadata = self._build_metadata(
             node=node,
             source_bytes=source_bytes,
             file_context=file_context,
         )
+        metadata.update(
+            self._build_breadcrumb_metadata(
+                node=node,
+                symbol=symbol,
+                symbol_stack=symbol_stack,
+                file_context=file_context,
+                signature=signature,
+                symbol_type=symbol_type,
+            )
+        )
+        context_path_parts = metadata["context_path_parts"]
+        file_path_parts = metadata["file_path_parts"]
+        symbol_path = metadata["symbol_path"]
 
         return CodeChunk(
             content=content,
@@ -187,11 +216,12 @@ class ASTChunker:
             language="swift",
             symbol=symbol,
             qualified_symbol=qualified_symbol,
-            symbol_type=self._symbol_type(
-                node=node,
-                content=content,
-            ),
+            symbol_type=symbol_type,
             parent_symbol=parent_symbol,
+            context_path=metadata["context_path"],
+            context_path_parts=context_path_parts,
+            file_path_parts=file_path_parts,
+            symbol_path=symbol_path,
             signature=signature,
             metadata=metadata,
         )
@@ -201,6 +231,9 @@ class ASTChunker:
         node: Node,
         content: str,
     ) -> str:
+
+        if self._is_extension_declaration(node):
+            return "extension_declaration"
 
         if node.type != "class_declaration":
             return node.type
@@ -229,6 +262,23 @@ class ASTChunker:
             return None
 
         return match.group(1)
+
+    def _context_symbol(
+        self,
+        node: Node,
+        symbol: str | None,
+    ) -> str | None:
+
+        if symbol is None:
+            return None
+
+        if (
+            node.type == "extension_declaration"
+            or self._is_extension_declaration(node)
+        ):
+            return f"extension {symbol}"
+
+        return symbol
 
     # ------------------------------------------------------------------
     # Source extraction
@@ -509,6 +559,97 @@ class ASTChunker:
             )
 
         return metadata
+
+    def _build_breadcrumb_metadata(
+        self,
+        node: Node,
+        symbol: str | None,
+        symbol_stack: list[str],
+        file_context: FileContext,
+        signature: str | None,
+        symbol_type: str,
+    ) -> dict:
+
+        path_parts = [
+            part
+            for part in file_context.source_path.split("/")
+            if part
+        ]
+        symbol_path = [
+            *symbol_stack,
+        ]
+        context_symbol = self._context_symbol(
+            node=node,
+            symbol=symbol,
+        )
+
+        if context_symbol:
+            symbol_path.append(context_symbol)
+
+        context_path_parts = []
+
+        if file_context.module:
+            context_path_parts.append(
+                f"Module: {file_context.module}"
+            )
+
+        context_path_parts.append(
+            f"File: {file_context.source_path}"
+        )
+
+        context_path_parts.extend(
+            self._breadcrumb_label(
+                value=value,
+                is_current=index == len(symbol_path) - 1,
+                current_node=node,
+                signature=signature,
+                symbol_type=symbol_type,
+            )
+            for index, value in enumerate(symbol_path)
+        )
+
+        return {
+            "context_path": " > ".join(context_path_parts),
+            "context_path_parts": context_path_parts,
+            "file_path_parts": path_parts,
+            "symbol_path": symbol_path,
+        }
+
+    def _breadcrumb_label(
+        self,
+        value: str,
+        is_current: bool,
+        current_node: Node,
+        signature: str | None,
+        symbol_type: str,
+    ) -> str:
+
+        if value.startswith("extension "):
+            return f"Extension: {value.removeprefix('extension ')}"
+
+        if not is_current:
+            return f"Parent: {value}"
+
+        if current_node.type == "function_declaration":
+            return f"Function: {signature or value}"
+
+        if current_node.type == "init_declaration":
+            return f"Initializer: {signature or value}"
+
+        return f"{self._declaration_label(symbol_type)}: {value}"
+
+    def _declaration_label(
+        self,
+        symbol_type: str,
+    ) -> str:
+
+        return {
+            "protocol_declaration": "Protocol",
+            "class_declaration": "Class",
+            "struct_declaration": "Struct",
+            "enum_declaration": "Enum",
+            "extension_declaration": "Extension",
+        }.get(symbol_type, "Symbol")
 
     def _is_extension_declaration(
         self,
