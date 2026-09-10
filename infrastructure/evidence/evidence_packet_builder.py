@@ -395,6 +395,7 @@ class EvidencePacketBuilder:
                 chunk.qualified_symbol or "",
                 chunk.symbol_type or "",
                 chunk.signature or "",
+                self._chunk_context_search_text(chunk),
                 chunk.content,
             ]
             if value
@@ -536,6 +537,10 @@ class EvidencePacketBuilder:
             symbol=chunk.qualified_symbol or chunk.symbol,
             symbol_type=chunk.symbol_type,
             signature=chunk.signature,
+            context_path=(
+                chunk.context_path
+                or chunk.metadata.get("context_path")
+            ),
         )
 
     def _select_facts_for_intent(
@@ -733,6 +738,7 @@ class EvidencePacketBuilder:
                 chunk.source,
                 chunk.symbol or "",
                 chunk.qualified_symbol or "",
+                self._chunk_context_search_text(chunk),
                 chunk.content,
             ]
             if value
@@ -1015,6 +1021,36 @@ class EvidencePacketBuilder:
             part.lower()
             for part in Path(path).parts
         }
+
+    def _chunk_context_search_text(
+        self,
+        chunk: CodeChunk,
+    ) -> str:
+
+        values = []
+        metadata = chunk.metadata
+
+        context_path = (
+            chunk.context_path
+            or metadata.get("context_path")
+        )
+        if context_path:
+            values.append(context_path)
+
+        values.extend(chunk.context_path_parts)
+        values.extend(chunk.file_path_parts)
+        values.extend(chunk.symbol_path)
+
+        for key in [
+            "context_path_parts",
+            "file_path_parts",
+            "symbol_path",
+        ]:
+            items = metadata.get(key, [])
+            if items:
+                values.extend(str(item) for item in items)
+
+        return " ".join(values)
 
     def _with_fact_score(
         self,

@@ -12,6 +12,7 @@ class EvidenceItem:
     symbol: str | None = None
     symbol_type: str | None = None
     signature: str | None = None
+    context_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,11 @@ class EvidencePacket:
             if item.signature:
                 metadata.append(
                     f"Signature: {item.signature}"
+                )
+
+            if item.context_path:
+                metadata.append(
+                    f"Context path: {item.context_path}"
                 )
 
             sections.append(

@@ -16,6 +16,11 @@ class CodeChunk:
     symbol_type: str | None = None
     parent_symbol: str | None = None
 
+    context_path: str | None = None
+    context_path_parts: list[str] = field(default_factory=list)
+    file_path_parts: list[str] = field(default_factory=list)
+    symbol_path: list[str] = field(default_factory=list)
+
     signature: str | None = None
 
     metadata: dict = field(default_factory=dict)

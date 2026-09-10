@@ -403,6 +403,17 @@ class SourceIndexer:
         module: str | None = None,
     ) -> list[CodeChunk]:
 
+        breadcrumb = self._breadcrumb_metadata(
+            source=source,
+            module=module,
+            symbol_path=[
+                Path(source).stem,
+            ],
+            current_label=(
+                f"File symbol: {Path(source).stem}"
+            ),
+        )
+
         return [
             CodeChunk(
                 content=content,
@@ -416,15 +427,55 @@ class SourceIndexer:
                 symbol=Path(source).stem,
                 qualified_symbol=Path(source).stem,
                 symbol_type="file",
+                context_path=breadcrumb["context_path"],
+                context_path_parts=breadcrumb[
+                    "context_path_parts"
+                ],
+                file_path_parts=breadcrumb["file_path_parts"],
+                symbol_path=breadcrumb["symbol_path"],
                 metadata={
                     "module": module,
                     "imports": self._source_imports(
                         content=content,
                         language=language,
                     ),
+                    **breadcrumb,
                 },
             )
         ]
+
+    def _breadcrumb_metadata(
+        self,
+        source: str,
+        module: str | None = None,
+        symbol_path: list[str] | None = None,
+        current_label: str | None = None,
+    ) -> dict:
+
+        context_path_parts = []
+
+        if module:
+            context_path_parts.append(
+                f"Module: {module}"
+            )
+
+        context_path_parts.append(
+            f"File: {source}"
+        )
+
+        if current_label:
+            context_path_parts.append(current_label)
+
+        return {
+            "context_path": " > ".join(context_path_parts),
+            "context_path_parts": context_path_parts,
+            "file_path_parts": [
+                part
+                for part in source.split("/")
+                if part
+            ],
+            "symbol_path": symbol_path or [],
+        }
 
     def _source_imports(
         self,
@@ -478,9 +529,27 @@ class SourceIndexer:
 
             declaration_kind = match.group(1)
             symbol = match.group(2)
+            context_symbol = (
+                f"extension {symbol}"
+                if declaration_kind == "extension"
+                else symbol
+            )
             end_line = self._swift_declaration_end_line(
                 lines=parse_lines,
                 start_line=index,
+            )
+            breadcrumb = self._breadcrumb_metadata(
+                source=source,
+                module=module,
+                symbol_path=[context_symbol],
+                current_label=(
+                    f"Extension: {symbol}"
+                    if declaration_kind == "extension"
+                    else (
+                        f"{declaration_kind.title()}: "
+                        f"{symbol}"
+                    )
+                ),
             )
 
             chunks.append(
@@ -493,10 +562,18 @@ class SourceIndexer:
                     end_line=end_line,
                     language="swift",
                     symbol=symbol,
-                    qualified_symbol=symbol,
+                    qualified_symbol=context_symbol,
                     symbol_type=(
                         f"{declaration_kind}_declaration"
                     ),
+                    context_path=breadcrumb["context_path"],
+                    context_path_parts=breadcrumb[
+                        "context_path_parts"
+                    ],
+                    file_path_parts=breadcrumb[
+                        "file_path_parts"
+                    ],
+                    symbol_path=breadcrumb["symbol_path"],
                     metadata={
                         "module": module,
                         "imports": imports,
@@ -504,6 +581,7 @@ class SourceIndexer:
                         "inherits_or_conforms": [],
                         "dependencies": [],
                         "calls": [],
+                        **breadcrumb,
                     },
                 )
             )
@@ -624,6 +702,14 @@ class SourceIndexer:
                 "end_lineno",
                 node.lineno,
             )
+            breadcrumb = self._breadcrumb_metadata(
+                source=source,
+                symbol_path=[node.name],
+                current_label=(
+                    f"{type(node).__name__}: "
+                    f"{node.name}"
+                ),
+            )
 
             chunks.append(
                 CodeChunk(
@@ -637,12 +723,21 @@ class SourceIndexer:
                     symbol=node.name,
                     qualified_symbol=node.name,
                     symbol_type=type(node).__name__,
+                    context_path=breadcrumb["context_path"],
+                    context_path_parts=breadcrumb[
+                        "context_path_parts"
+                    ],
+                    file_path_parts=breadcrumb[
+                        "file_path_parts"
+                    ],
+                    symbol_path=breadcrumb["symbol_path"],
                     signature=self._python_signature(
                         node=node,
                         lines=lines,
                     ),
                     metadata={
                         "bases": self._python_bases(node),
+                        **breadcrumb,
                     },
                 )
             )
@@ -665,6 +760,11 @@ class SourceIndexer:
             if not line.strip():
                 continue
 
+            breadcrumb = self._breadcrumb_metadata(
+                source=source,
+                current_label=f"Line: {line_number}",
+            )
+
             chunks.append(
                 CodeChunk(
                     content=line.strip(),
@@ -674,6 +774,15 @@ class SourceIndexer:
                     language=language,
                     symbol=None,
                     symbol_type="line",
+                    context_path=breadcrumb["context_path"],
+                    context_path_parts=breadcrumb[
+                        "context_path_parts"
+                    ],
+                    file_path_parts=breadcrumb[
+                        "file_path_parts"
+                    ],
+                    symbol_path=breadcrumb["symbol_path"],
+                    metadata=breadcrumb,
                 )
             )
 

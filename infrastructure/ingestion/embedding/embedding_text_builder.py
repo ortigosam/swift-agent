@@ -53,6 +53,15 @@ class EmbeddingTextBuilder:
 
         lines = []
 
+        context_path = (
+            chunk.context_path
+            or metadata.get("context_path")
+        )
+        if context_path:
+            lines.append(
+                f"Context path: {context_path}"
+            )
+
         module = metadata.get("module")
         if module:
             lines.append(
