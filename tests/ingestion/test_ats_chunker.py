@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 from infrastructure.ingestion.parser.swift_parser import (
     SwiftParser,
 )
@@ -10,31 +13,32 @@ from infrastructure.ingestion.module.xcode_module_resolver import (
     XcodeModuleResolver,
 )
 
+# Prueba el funcionamiento del ATSChunker y muestra que chunks devuelve para un archivo Swift específico
 
-source = """
-protocol CashbackRepository {
-    func getCashback() async throws -> Cashback
-}
+APPIMA_REPOSITORY_PATH = Path(
+    os.environ.get(
+        "APPIMA_REPOSITORY_PATH",
+        "/Users/U01AE23C/projects/APPIMA",
+    )
+).expanduser().resolve()
 
-final class CashbackRepositoryImpl: CashbackRepository {
+PROJECT_PATH = (
+    APPIMA_REPOSITORY_PATH
+    / "APPIMA.xcodeproj"
+)
 
-    private let dataSource: CashbackDataSource
+SOURCE_PATH = (
+    APPIMA_REPOSITORY_PATH
+    / "APPIMA"
+    / "Navigation"
+    / "Deeplinks"
+    / "AppDeepLinkAuthGuard.swift"
+)
 
-    init(dataSource: CashbackDataSource) {
-        self.dataSource = dataSource
-    }
 
-    func getCashback() async throws -> Cashback {
-        try await dataSource.getCashback()
-    }
-}
-
-extension CashbackRepositoryImpl {
-    func getAdditionalCashback() async throws -> Cashback {
-        try await dataSource.getAdditionalCashback()
-    }
-}
-"""
+source = SOURCE_PATH.read_text(
+    encoding="utf-8"
+)
 
 
 parser = SwiftParser()
@@ -43,7 +47,7 @@ tree = parser.parse(source)
 
 
 module_resolver = XcodeModuleResolver(
-    "TuProyecto.xcodeproj",
+    str(PROJECT_PATH),
 )
 
 
@@ -55,9 +59,18 @@ chunker = ASTChunker(
 chunks = chunker.chunk(
     tree=tree,
     source=source,
-    source_path=(
-        "Ruta/real/CashbackRepositoryImpl.swift"
-    ),
+    source_path=str(SOURCE_PATH),
+)
+
+assert module_resolver.resolve(
+    str(SOURCE_PATH)
+) == "ADAM_ENT_FULL"
+
+assert chunks
+
+assert all(
+    chunk.metadata.get("module") == "ADAM_ENT_FULL"
+    for chunk in chunks
 )
 
 
@@ -81,6 +94,8 @@ for chunk in chunks:
     )
 
     print("METADATA:", chunk.metadata)
+
+    print("CONTEXT PATH:", chunk.context_path)
 
     print("====================")
 

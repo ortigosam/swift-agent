@@ -80,6 +80,13 @@ class XcodeModuleResolver(ModuleResolver):
         )
 
         if not file_reference_ids:
+            modules = self._find_synchronized_target_names(
+                relative_path
+            )
+
+            if modules:
+                return modules[0]
+
             return None
 
         build_file_ids = self._find_build_files(
@@ -94,6 +101,13 @@ class XcodeModuleResolver(ModuleResolver):
         )
 
         if not source_phase_ids:
+            modules = self._find_synchronized_target_names(
+                relative_path
+            )
+
+            if modules:
+                return modules[0]
+
             return None
 
         modules = self._find_target_names(
@@ -101,12 +115,33 @@ class XcodeModuleResolver(ModuleResolver):
         )
 
         if not modules:
+            modules = self._find_synchronized_target_names(
+                relative_path
+            )
+
+            if modules:
+                return modules[0]
+
             return None
 
         # A file can technically belong to multiple targets.
         # The current CodeChunk model expects one module,
         # so we use the first deterministic result.
         return modules[0]
+
+    def _find_synchronized_target_names(
+        self,
+        relative_path: Path,
+    ) -> list[str]:
+
+        normalized = self._normalize_path(
+            relative_path
+        )
+
+        return self._synchronized_targets_by_path.get(
+            normalized,
+            [],
+        )
 
     # ------------------------------------------------------------------
     # Loading
@@ -238,6 +273,11 @@ class XcodeModuleResolver(ModuleResolver):
             "fileRef",
         )
 
+        attributes["target"] = self._parse_scalar(
+            body,
+            "target",
+        )
+
         attributes["children"] = self._parse_array(
             body,
             "children",
@@ -251,6 +291,25 @@ class XcodeModuleResolver(ModuleResolver):
         attributes["buildPhases"] = self._parse_array(
             body,
             "buildPhases",
+        )
+
+        attributes["exceptions"] = self._parse_array(
+            body,
+            "exceptions",
+        )
+
+        attributes["fileSystemSynchronizedGroups"] = (
+            self._parse_array(
+                body,
+                "fileSystemSynchronizedGroups",
+            )
+        )
+
+        attributes["membershipExceptions"] = (
+            self._parse_value_array(
+                body,
+                "membershipExceptions",
+            )
         )
 
         return attributes
@@ -285,6 +344,24 @@ class XcodeModuleResolver(ModuleResolver):
             if obj.get("isa") == "PBXNativeTarget"
         }
 
+        self.synchronized_root_groups = {
+            object_id: obj
+            for object_id, obj in self.objects.items()
+            if (
+                obj.get("isa")
+                == "PBXFileSystemSynchronizedRootGroup"
+            )
+        }
+
+        self.synchronized_exception_sets = {
+            object_id: obj
+            for object_id, obj in self.objects.items()
+            if (
+                obj.get("isa")
+                == "PBXFileSystemSynchronizedBuildFileExceptionSet"
+            )
+        }
+
         self.parent_groups = {}
 
         for group_id, group in self.objects.items():
@@ -312,6 +389,119 @@ class XcodeModuleResolver(ModuleResolver):
                 normalized,
                 [],
             ).append(file_id)
+
+        self._synchronized_targets_by_path: dict[
+            str,
+            list[str],
+        ] = {}
+
+        self._build_synchronized_root_indexes()
+
+    def _build_synchronized_root_indexes(self) -> None:
+
+        for root_id, root in (
+            self.synchronized_root_groups.items()
+        ):
+            root_path = self._resolve_group_path(
+                root_id
+            )
+
+            if root_path is None:
+                continue
+
+            self._index_synchronized_group_targets(
+                root_id=root_id,
+                root_path=root_path,
+            )
+
+            self._index_synchronized_exceptions(
+                root=root,
+                root_path=root_path,
+            )
+
+    def _index_synchronized_group_targets(
+        self,
+        root_id: str,
+        root_path: Path,
+    ) -> None:
+
+        root_dir = self.project_root / root_path
+
+        if not root_dir.is_dir():
+            return
+
+        target_names = self._find_targets_for_synchronized_group(
+            root_id
+        )
+
+        if not target_names:
+            return
+
+        for source_file in root_dir.rglob("*.swift"):
+            relative_path = source_file.relative_to(
+                self.project_root
+            )
+            self._add_synchronized_target_path(
+                relative_path=relative_path,
+                target_names=target_names,
+            )
+
+    def _index_synchronized_exceptions(
+        self,
+        root: dict,
+        root_path: Path,
+    ) -> None:
+
+        for exception_id in root.get("exceptions", []):
+            exception = self.synchronized_exception_sets.get(
+                exception_id
+            )
+
+            if exception is None:
+                continue
+
+            target_id = self._extract_id(
+                exception.get("target")
+            )
+
+            target_names = self._target_names_by_ids(
+                [target_id] if target_id else []
+            )
+
+            if not target_names:
+                continue
+
+            for member_path in exception.get(
+                "membershipExceptions",
+                [],
+            ):
+                relative_path = root_path / member_path
+
+                self._add_synchronized_target_path(
+                    relative_path=relative_path,
+                    target_names=target_names,
+                )
+
+    def _add_synchronized_target_path(
+        self,
+        relative_path: Path,
+        target_names: list[str],
+    ) -> None:
+
+        normalized = self._normalize_path(
+            relative_path
+        )
+
+        current = self._synchronized_targets_by_path.setdefault(
+            normalized,
+            [],
+        )
+
+        current.extend(target_names)
+
+        self._synchronized_targets_by_path[normalized] = sorted(
+            set(current)
+        )
 
     # ------------------------------------------------------------------
     # File resolution
@@ -414,6 +604,65 @@ class XcodeModuleResolver(ModuleResolver):
 
         return path
 
+    def _resolve_group_path(
+        self,
+        group_id: str,
+    ) -> Path | None:
+
+        group = self.objects.get(group_id)
+
+        if group is None:
+            return None
+
+        path_value = (
+            group.get("path")
+            or group.get("name")
+        )
+
+        if not path_value:
+            return None
+
+        path = Path(
+            self._clean_value(path_value)
+        )
+
+        parent_id = self.parent_groups.get(
+            group_id
+        )
+
+        visited: set[str] = set()
+
+        while parent_id:
+
+            if parent_id in visited:
+                break
+
+            visited.add(parent_id)
+
+            parent = self.objects.get(
+                parent_id
+            )
+
+            if parent is None:
+                break
+
+            parent_path = (
+                parent.get("path")
+                or parent.get("name")
+            )
+
+            if parent_path:
+                path = (
+                    Path(self._clean_value(parent_path))
+                    / path
+                )
+
+            parent_id = self.parent_groups.get(
+                parent_id
+            )
+
+        return path
+
     # ------------------------------------------------------------------
     # Build phases / targets
     # ------------------------------------------------------------------
@@ -501,6 +750,61 @@ class XcodeModuleResolver(ModuleResolver):
             set(result)
         )
 
+    def _find_targets_for_synchronized_group(
+        self,
+        group_id: str,
+    ) -> list[str]:
+
+        result = []
+
+        for target_id, target in (
+            self.native_targets.items()
+        ):
+            synchronized_groups = set(
+                target.get(
+                    "fileSystemSynchronizedGroups",
+                    [],
+                )
+            )
+
+            if group_id not in synchronized_groups:
+                continue
+
+            result.extend(
+                self._target_names_by_ids([target_id])
+            )
+
+        return sorted(
+            set(result)
+        )
+
+    def _target_names_by_ids(
+        self,
+        target_ids: list[str],
+    ) -> list[str]:
+
+        result = []
+
+        for target_id in target_ids:
+            target = self.native_targets.get(target_id)
+
+            if target is None:
+                continue
+
+            name = target.get("name")
+
+            if not name:
+                name = target.get("productName")
+
+            if name:
+                result.append(
+                    self._clean_value(name)
+                )
+
+        return sorted(
+            set(result)
+        )
+
     # ------------------------------------------------------------------
     # Primitive parser helpers
     # ------------------------------------------------------------------
@@ -554,6 +858,39 @@ class XcodeModuleResolver(ModuleResolver):
             r"\b[A-Fa-f0-9]{8,32}\b",
             match.group(1),
         )
+
+    def _parse_value_array(
+        self,
+        body: str,
+        key: str,
+    ) -> list[str]:
+
+        pattern = (
+            rf"\b{re.escape(key)}\s*=\s*\("
+            rf"(.*?)"
+            rf"\);"
+        )
+
+        match = re.search(
+            pattern,
+            body,
+            re.DOTALL,
+        )
+
+        if match is None:
+            return []
+
+        result = []
+
+        for raw_value in match.group(1).split(","):
+            value = self._clean_value(raw_value)
+
+            if not value:
+                continue
+
+            result.append(value)
+
+        return result
 
     def _extract_id(
         self,
@@ -658,4 +995,3 @@ class XcodeModuleResolver(ModuleResolver):
         return str(
             Path(path).as_posix()
         ).strip("/")
-
