@@ -28,10 +28,7 @@ def test_evidence_packet_mode_uses_same_agent_tools():
         for tool in _tools_for_mode(INDEXING_MODE)
     ]
 
-    assert tool_names == [
-        "search_code",
-        "read_file",
-    ]
+    assert tool_names == []
 
 
 def test_indexed_modes_preload_indexed_evidence():

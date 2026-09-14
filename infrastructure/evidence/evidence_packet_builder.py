@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from infrastructure.evidence.source_indexer import (
 )
 from infrastructure.ingestion.chunking.code_chunk import (
     CodeChunk,
+)
+from infrastructure.ingestion.vector.semantic_code_index import (
+    SemanticCodeIndex,
 )
 
 
@@ -156,17 +160,39 @@ class EvidencePacketBuilder:
         repository_path: str = ".",
         top_k: int = 6,
         top_facts: int = 8,
+        use_vector_search: bool | None = None,
+        semantic_index: SemanticCodeIndex | None = None,
     ):
         self.repository_path = repository_path
         self.top_k = top_k
         self.top_facts = top_facts
         self.indexer = SourceIndexer()
         self.fact_extractor = FactExtractor()
+        self.use_vector_search = (
+            use_vector_search
+            if use_vector_search is not None
+            else os.environ.get(
+                "SWIFT_AGENT_VECTOR_SEARCH",
+                "",
+            ).lower()
+            in {
+                "1",
+                "true",
+                "yes",
+            }
+        )
+        self.semantic_index = semantic_index
 
     def build(
         self,
         query: str,
     ) -> EvidencePacket:
+
+        if self.use_vector_search:
+            semantic_packet = self._semantic_packet(query)
+
+            if semantic_packet is not None:
+                return semantic_packet
 
         intent = self._intent(query)
         terms = self._query_terms(query)
@@ -204,6 +230,12 @@ class EvidencePacketBuilder:
             )
             if score > 0
         ][:chunk_candidate_limit]
+
+        if self.use_vector_search:
+            best_chunks = self._merge_semantic_chunks(
+                query=query,
+                chunks=best_chunks,
+            )
 
         fact_candidate_limit = max(
             self.top_facts * 6,
@@ -259,6 +291,342 @@ class EvidencePacketBuilder:
                 for chunk in best_chunks
             ],
         )
+
+    def _semantic_packet(
+        self,
+        query: str,
+    ) -> EvidencePacket | None:
+
+        intent = self._intent(query)
+        terms = self._query_terms(query)
+        semantic_index = self.semantic_index or SemanticCodeIndex(
+            repository_path=self.repository_path,
+        )
+
+        semantic_results = semantic_index.search(
+            query,
+            limit=max(self.top_k * 6, 30),
+            rebuild=self._vector_rebuild_enabled(),
+        )
+
+        if not semantic_results:
+            return None
+
+        score_by_chunk = {
+            self._chunk_key(result.chunk): result.score
+            for result in semantic_results
+        }
+        semantic_chunks = [
+            result.chunk
+            for result in semantic_results
+            if result.score > 0
+        ]
+
+        selected_chunks = self._select_semantic_chunks(
+            intent=intent,
+            chunks=semantic_chunks,
+            terms=terms,
+        )
+
+        items = [
+            self._to_semantic_evidence_item(
+                chunk=chunk,
+                score=self._vector_score(
+                    score_by_chunk.get(
+                        self._chunk_key(chunk),
+                        0,
+                    )
+                ),
+                terms=terms,
+            )
+            for chunk in selected_chunks
+        ][: self._semantic_top_k()]
+
+        if not items:
+            return None
+
+        return EvidencePacket(
+            query=query,
+            facts=[],
+            items=items,
+        )
+
+    def _to_semantic_evidence_item(
+        self,
+        chunk: CodeChunk,
+        score: int,
+        terms: set[str],
+    ) -> EvidenceItem:
+
+        item = self._to_evidence_item(
+            chunk=chunk,
+            score=score,
+        )
+
+        if chunk.symbol_type != "file":
+            return item
+
+        compact_content = self._compact_file_chunk_content(
+            content=item.content,
+            terms=terms,
+            symbol=item.symbol,
+        )
+
+        symbol = item.symbol
+        declarations = self._declarations_in_content(
+            compact_content
+        )
+
+        if declarations:
+            symbol = ", ".join(
+                [
+                    value
+                    for value in [
+                        item.symbol,
+                        *declarations,
+                    ]
+                    if value
+                ]
+            )
+            compact_content = (
+                "Declarations: "
+                + ", ".join(declarations)
+                + "\n"
+                + compact_content
+            )
+
+        return EvidenceItem(
+            file=item.file,
+            start_line=item.start_line,
+            end_line=item.end_line,
+            score=item.score,
+            content=compact_content,
+            language=item.language,
+            symbol=symbol,
+            symbol_type=item.symbol_type,
+            signature=item.signature,
+            context_path=item.context_path,
+        )
+
+    def _declarations_in_content(
+        self,
+        content: str,
+    ) -> list[str]:
+
+        declarations = []
+
+        for match in re.finditer(
+            r"\b(?:class|struct|enum|protocol)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)",
+            content,
+        ):
+            declarations.append(match.group(1))
+
+        return list(
+            dict.fromkeys(declarations)
+        )
+
+    def _compact_file_chunk_content(
+        self,
+        content: str,
+        terms: set[str],
+        symbol: str | None,
+    ) -> str:
+
+        lines = content.splitlines()
+        selected_indexes: set[int] = set()
+
+        declaration_pattern = re.compile(
+            r"\b(class|struct|enum|protocol)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        meaningful_terms = {
+            term
+            for term in terms
+            if len(term) >= 6
+        }
+        symbol_lower = (
+            symbol or ""
+        ).lower()
+
+        for index, line in enumerate(lines):
+            line_lower = line.lower()
+            declaration_match = declaration_pattern.search(line)
+
+            if declaration_match:
+                declaration_name = declaration_match.group(2)
+                declaration_name_lower = declaration_name.lower()
+
+                if (
+                    (
+                        symbol_lower
+                        and symbol_lower in declaration_name_lower
+                    )
+                    or declaration_name.startswith("Default")
+                    or any(
+                        term in line_lower
+                        for term in meaningful_terms
+                    )
+                ):
+                    selected_indexes.update(
+                        self._line_window(
+                            index=index,
+                            line_count=len(lines),
+                            before=1,
+                            after=3,
+                        )
+                    )
+
+                continue
+
+            if line_lower.lstrip().startswith("import "):
+                continue
+
+            if any(term in line_lower for term in meaningful_terms):
+                selected_indexes.update(
+                    self._line_window(
+                        index=index,
+                        line_count=len(lines),
+                        before=4,
+                        after=8,
+                    )
+                )
+
+        if not selected_indexes:
+            return content
+
+        return self._join_compacted_lines(
+            lines=lines,
+            selected_indexes=selected_indexes,
+        )
+
+    def _line_window(
+        self,
+        *,
+        index: int,
+        line_count: int,
+        before: int,
+        after: int,
+    ) -> set[int]:
+
+        return set(
+            range(
+                max(0, index - before),
+                min(line_count, index + after + 1),
+            )
+        )
+
+    def _join_compacted_lines(
+        self,
+        *,
+        lines: list[str],
+        selected_indexes: set[int],
+    ) -> str:
+
+        result = []
+        previous_index = None
+
+        for index in sorted(selected_indexes):
+            if (
+                previous_index is not None
+                and index > previous_index + 1
+            ):
+                result.append("...")
+
+            result.append(lines[index])
+            previous_index = index
+
+        return "\n".join(result)
+
+    def _select_semantic_chunks(
+        self,
+        intent: str,
+        chunks: list[CodeChunk],
+        terms: set[str],
+    ) -> list[CodeChunk]:
+
+        if intent == "flow_tracing":
+            flow_chunks = [
+                chunk
+                for chunk in chunks
+                if self._is_flow_chunk(
+                    chunk=chunk,
+                    terms=terms,
+                )
+            ]
+
+            return self._diversify_chunks(
+                flow_chunks or chunks,
+                limit=self._semantic_top_k(),
+                max_per_file=1,
+            )
+
+        return self._diversify_chunks(
+            chunks,
+            limit=self._semantic_top_k(),
+            max_per_file=1,
+        )
+
+    def _semantic_top_k(self) -> int:
+
+        configured = int(
+            os.environ.get(
+                "SWIFT_AGENT_VECTOR_TOP_K",
+                "6",
+            )
+        )
+
+        return max(
+            1,
+            min(
+                self.top_k,
+                configured,
+            ),
+        )
+
+    def _merge_semantic_chunks(
+        self,
+        query: str,
+        chunks: list[CodeChunk],
+    ) -> list[CodeChunk]:
+
+        semantic_index = self.semantic_index or SemanticCodeIndex(
+            repository_path=self.repository_path,
+            indexer=self.indexer,
+        )
+
+        semantic_results = semantic_index.search(
+            query,
+            limit=max(self.top_k * 3, 12),
+            rebuild=self._vector_rebuild_enabled(),
+        )
+
+        return self._deduplicate_chunks(
+            [
+                result.chunk
+                for result in semantic_results
+                if result.score > 0
+            ]
+            + chunks
+        )
+
+    def _vector_rebuild_enabled(self) -> bool:
+
+        return os.environ.get(
+            "SWIFT_AGENT_VECTOR_REBUILD",
+            "",
+        ).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+    def _vector_score(
+        self,
+        score: float,
+    ) -> int:
+
+        return int(score * 1000)
 
     def _intent(
         self,
@@ -896,6 +1264,18 @@ class EvidencePacketBuilder:
             unique.setdefault(key, chunk)
 
         return list(unique.values())
+
+    def _chunk_key(
+        self,
+        chunk: CodeChunk,
+    ) -> tuple:
+
+        return (
+            chunk.source,
+            chunk.start_line,
+            chunk.end_line,
+            chunk.symbol,
+        )
 
     def _score_fact(
         self,

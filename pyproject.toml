@@ -17,6 +17,11 @@ dependencies = [
     "tree-sitter-swift>=0.7.3",
 ]
 
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=5.1.1",
+]
+
 [project.scripts]
 firstagent = "firstagent:main"
 

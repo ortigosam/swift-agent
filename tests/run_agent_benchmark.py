@@ -438,6 +438,10 @@ async def _run_benchmark(args):
     repository_path = args.repository_path.expanduser().resolve()
     modes = _benchmark_modes(args)
     task_definitions = _load_agent_tasks(args.tasks_module)
+    task_definitions = _filter_agent_tasks(
+        task_definitions=task_definitions,
+        task_ids=args.task_id,
+    )
     summary = []
 
     os.chdir(repository_path)
@@ -446,6 +450,18 @@ async def _run_benchmark(args):
     print(f"BENCHMARK TASKS MODULE: {args.tasks_module}")
     print(f"BENCHMARK LLM TIMEOUT: {args.llm_timeout_seconds}s")
     print(f"BENCHMARK MODEL: {args.model}")
+    print(
+        "BENCHMARK VECTOR SEARCH: "
+        f"{os.environ.get('SWIFT_AGENT_VECTOR_SEARCH', '') or 'disabled'}"
+    )
+    print(
+        "BENCHMARK VECTOR DB: "
+        f"{os.environ.get('SWIFT_AGENT_VECTOR_DB_PATH', 'default')}"
+    )
+    print(
+        "BENCHMARK EMBEDDING MODEL: "
+        f"{os.environ.get('SWIFT_AGENT_EMBEDDING_MODEL', 'default')}"
+    )
 
     for mode in modes:
         print("\n")
@@ -592,8 +608,40 @@ def _parse_args():
             "benchmark_results/logs/benchmark-<timestamp>.log."
         ),
     )
+    parser.add_argument(
+        "--task-id",
+        action="append",
+        default=[],
+        help=(
+            "Run only the selected task id. Can be passed "
+            "multiple times."
+        ),
+    )
 
     return parser.parse_args()
+
+
+def _filter_agent_tasks(
+    task_definitions: list[dict],
+    task_ids: list[str],
+) -> list[dict]:
+
+    if not task_ids:
+        return task_definitions
+
+    selected = [
+        task
+        for task in task_definitions
+        if task["id"] in set(task_ids)
+    ]
+
+    if not selected:
+        raise ValueError(
+            "No benchmark tasks matched --task-id values: "
+            + ", ".join(task_ids)
+        )
+
+    return selected
 
 
 def _benchmark_modes(args) -> list[str]:
@@ -625,6 +673,9 @@ def _normalize_mode(mode: str) -> str:
 
 def _tools_for_mode(mode: str):
 
+    if _uses_indexed_evidence(mode):
+        return []
+
     copilot_search_code = to_copilot_tool(
         search_code
     )
@@ -646,9 +697,11 @@ class _IndexedEvidence:
         self,
         prompt_section: str,
         packet,
+        build_latency_ms: int,
     ):
         self.prompt_section = prompt_section
         self.packet = packet
+        self.build_latency_ms = build_latency_ms
 
 
 def _indexed_evidence_for_mode(
@@ -665,13 +718,23 @@ def _indexed_evidence_for_mode(
         top_k=8,
         top_facts=8,
     )
+    start = time.perf_counter()
     packet = builder.build(task)
+    build_latency_ms = int(
+        (time.perf_counter() - start) * 1000
+    )
 
     return _IndexedEvidence(
         prompt_section=packet.to_prompt_section(
-            max_chars_per_item=1200,
+            max_chars_per_item=int(
+                os.environ.get(
+                    "BENCHMARK_MAX_CHARS_PER_EVIDENCE",
+                    "800",
+                )
+            ),
         ),
         packet=packet,
+        build_latency_ms=build_latency_ms,
     )
 
 
@@ -729,6 +792,21 @@ async def _run_task(
     )
 
     start = time.perf_counter()
+
+    if indexed_evidence is not None:
+        print("\nINDEXED EVIDENCE:")
+        print(
+            "Build latency ms: "
+            f"{indexed_evidence.build_latency_ms}"
+        )
+        print(
+            "Facts: "
+            f"{len(indexed_evidence.packet.facts)}"
+        )
+        print(
+            "Items: "
+            f"{len(indexed_evidence.packet.items)}"
+        )
 
     result = await graph.ainvoke(
         state
@@ -793,6 +871,28 @@ async def _run_task(
             indexed_evidence.packet.to_dict()
             if indexed_evidence is not None
             else None
+        ),
+        "indexed_evidence_build_latency_ms": (
+            indexed_evidence.build_latency_ms
+            if indexed_evidence is not None
+            else None
+        ),
+        "vector_search_enabled": (
+            os.environ.get(
+                "SWIFT_AGENT_VECTOR_SEARCH",
+                "",
+            ).lower()
+            in {
+                "1",
+                "true",
+                "yes",
+            }
+        ),
+        "vector_database_path": os.environ.get(
+            "SWIFT_AGENT_VECTOR_DB_PATH"
+        ),
+        "embedding_model": os.environ.get(
+            "SWIFT_AGENT_EMBEDDING_MODEL"
         ),
         "llm_invocations": invocations,
         "answer": answer,
