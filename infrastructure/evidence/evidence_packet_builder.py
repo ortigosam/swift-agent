@@ -54,14 +54,21 @@ STOP_WORDS = {
 }
 
 FLOW_KEYWORDS = {
+    "analyze",
     "before",
+    "call",
+    "calls",
+    "chain",
     "dispatch",
     "dispatching",
     "flow",
     "handled",
     "handler",
     "happens",
+    "path",
     "starts",
+    "trace",
+    "tracing",
     "when",
 }
 
@@ -305,22 +312,38 @@ class EvidencePacketBuilder:
 
         semantic_results = semantic_index.search(
             query,
-            limit=max(self.top_k * 6, 30),
+            limit=self._semantic_candidate_limit(intent),
             rebuild=self._vector_rebuild_enabled(),
         )
 
         if not semantic_results:
             return None
 
-        score_by_chunk = {
+        vector_score_by_chunk = {
             self._chunk_key(result.chunk): result.score
             for result in semantic_results
         }
-        semantic_chunks = [
-            result.chunk
-            for result in semantic_results
-            if result.score > 0
-        ]
+        semantic_chunks = self._rerank_semantic_chunks(
+            chunks=[
+                result.chunk
+                for result in semantic_results
+                if result.score > 0
+            ],
+            vector_score_by_chunk=vector_score_by_chunk,
+            terms=terms,
+            intent=intent,
+        )
+        semantic_chunks = self._expand_semantic_context(
+            chunks=semantic_chunks,
+            terms=terms,
+            intent=intent,
+        )
+        semantic_chunks = self._rerank_semantic_chunks(
+            chunks=semantic_chunks,
+            vector_score_by_chunk=vector_score_by_chunk,
+            terms=terms,
+            intent=intent,
+        )
 
         selected_chunks = self._select_semantic_chunks(
             intent=intent,
@@ -331,16 +354,19 @@ class EvidencePacketBuilder:
         items = [
             self._to_semantic_evidence_item(
                 chunk=chunk,
-                score=self._vector_score(
-                    score_by_chunk.get(
+                score=self._semantic_evidence_score(
+                    chunk=chunk,
+                    vector_score=vector_score_by_chunk.get(
                         self._chunk_key(chunk),
                         0,
-                    )
+                    ),
+                    terms=terms,
+                    intent=intent,
                 ),
                 terms=terms,
             )
             for chunk in selected_chunks
-        ][: self._semantic_top_k()]
+        ][: self._semantic_top_k(intent)]
 
         if not items:
             return None
@@ -350,6 +376,280 @@ class EvidencePacketBuilder:
             facts=[],
             items=items,
         )
+
+    def _rerank_semantic_chunks(
+        self,
+        *,
+        chunks: list[CodeChunk],
+        vector_score_by_chunk: dict[tuple, float],
+        terms: set[str],
+        intent: str,
+    ) -> list[CodeChunk]:
+
+        return [
+            chunk
+            for _, chunk in sorted(
+                [
+                    (
+                        self._semantic_rerank_score(
+                            chunk=chunk,
+                            vector_score=vector_score_by_chunk.get(
+                                self._chunk_key(chunk),
+                                0,
+                            ),
+                            terms=terms,
+                            intent=intent,
+                        ),
+                        chunk,
+                    )
+                    for chunk in self._deduplicate_chunks(chunks)
+                ],
+                key=lambda item: (
+                    item[0],
+                    self._symbol_priority(item[1]),
+                    -item[1].start_line,
+                ),
+                reverse=True,
+            )
+            if _ > 0
+        ]
+
+    def _semantic_rerank_score(
+        self,
+        *,
+        chunk: CodeChunk,
+        vector_score: float,
+        terms: set[str],
+        intent: str,
+    ) -> int:
+
+        return (
+            self._vector_score(vector_score)
+            + self._score(
+                chunk=chunk,
+                terms=terms,
+                intent=intent,
+            )
+            * 25
+            + self._trace_layer_boost(
+                chunk=chunk,
+                terms=terms,
+                intent=intent,
+            )
+            - self._semantic_path_penalty(
+                chunk=chunk,
+                intent=intent,
+            )
+        )
+
+    def _semantic_evidence_score(
+        self,
+        *,
+        chunk: CodeChunk,
+        vector_score: float,
+        terms: set[str],
+        intent: str,
+    ) -> int:
+
+        return self._semantic_rerank_score(
+            chunk=chunk,
+            vector_score=vector_score,
+            terms=terms,
+            intent=intent,
+        )
+
+    def _expand_semantic_context(
+        self,
+        *,
+        chunks: list[CodeChunk],
+        terms: set[str],
+        intent: str,
+    ) -> list[CodeChunk]:
+
+        if intent != "flow_tracing":
+            return chunks
+
+        selected = self._deduplicate_chunks(chunks)
+        selected_keys = {
+            self._chunk_key(chunk)
+            for chunk in selected
+        }
+        symbols = self._context_expansion_symbols(selected)
+
+        expanded = list(selected)
+        for chunk in selected:
+            if self._chunk_key(chunk) in selected_keys:
+                related = self._related_semantic_chunks(
+                    anchor=chunk,
+                    candidates=selected,
+                    symbols=symbols,
+                    terms=terms,
+                )
+                expanded.extend(related)
+
+        return self._deduplicate_chunks(expanded)
+
+    def _context_expansion_symbols(
+        self,
+        chunks: list[CodeChunk],
+    ) -> set[str]:
+
+        symbols = set()
+
+        for chunk in chunks:
+            for value in [
+                chunk.symbol,
+                chunk.qualified_symbol,
+                chunk.parent_symbol,
+                *chunk.symbol_path,
+            ]:
+                if not value:
+                    continue
+
+                for symbol in re.findall(
+                    r"[A-Z][A-Za-z0-9_]{2,}",
+                    value,
+                ):
+                    symbols.add(symbol.lower())
+
+            for symbol in re.findall(
+                r"\b[A-Z][A-Za-z0-9_]{2,}\b",
+                chunk.content,
+            ):
+                symbols.add(symbol.lower())
+
+        return symbols
+
+    def _related_semantic_chunks(
+        self,
+        *,
+        anchor: CodeChunk,
+        candidates: list[CodeChunk],
+        symbols: set[str],
+        terms: set[str],
+    ) -> list[CodeChunk]:
+
+        related = []
+        anchor_file_parts = set(Path(anchor.source).parts)
+
+        for candidate in candidates:
+            if self._chunk_key(candidate) == self._chunk_key(anchor):
+                continue
+
+            candidate_text = self._semantic_searchable_text(
+                candidate
+            )
+            same_feature_area = bool(
+                anchor_file_parts & set(Path(candidate.source).parts)
+            )
+
+            if (
+                same_feature_area
+                and self._trace_layer_boost(
+                    chunk=candidate,
+                    terms=terms,
+                    intent="flow_tracing",
+                )
+                > 0
+            ):
+                related.append(candidate)
+                continue
+
+            if any(
+                symbol in candidate_text
+                for symbol in symbols
+            ):
+                related.append(candidate)
+
+        return related
+
+    def _semantic_searchable_text(
+        self,
+        chunk: CodeChunk,
+    ) -> str:
+
+        return " ".join(
+            value
+            for value in [
+                chunk.source,
+                chunk.symbol or "",
+                chunk.qualified_symbol or "",
+                chunk.parent_symbol or "",
+                chunk.signature or "",
+                self._chunk_context_search_text(chunk),
+                chunk.content,
+            ]
+            if value
+        ).lower()
+
+    def _trace_layer_boost(
+        self,
+        *,
+        chunk: CodeChunk,
+        terms: set[str],
+        intent: str,
+    ) -> int:
+
+        if intent != "flow_tracing":
+            return 0
+
+        searchable = self._semantic_searchable_text(chunk)
+        score = 0
+
+        for marker in [
+            "viewmodel",
+            "usecase",
+            "repository",
+            "datasource",
+            "remote",
+            "cache",
+            "api.request",
+            "callasfunction",
+        ]:
+            if marker in searchable:
+                score += 35
+
+        for term in terms:
+            if len(term) >= 6 and term in searchable:
+                score += 10
+
+        return score
+
+    def _semantic_path_penalty(
+        self,
+        *,
+        chunk: CodeChunk,
+        intent: str,
+    ) -> int:
+
+        if intent != "flow_tracing":
+            return 0
+
+        if self._path_penalty(chunk.source) > 0:
+            return 1000
+
+        return 0
+
+    def _semantic_candidate_limit(
+        self,
+        intent: str,
+    ) -> int:
+
+        if intent == "flow_tracing":
+            return max(self.top_k * 50, 300)
+
+        return max(self.top_k * 8, 40)
+
+    def _legacy_semantic_chunks(
+        self,
+        semantic_results,
+    ) -> list[CodeChunk]:
+
+        return [
+            result.chunk
+            for result in semantic_results
+            if result.score > 0
+        ]
 
     def _to_semantic_evidence_item(
         self,
@@ -376,21 +676,31 @@ class EvidencePacketBuilder:
         declarations = self._declarations_in_content(
             compact_content
         )
+        functions = self._functions_in_content(
+            compact_content
+        )
+        relevant_symbols = self._rank_relevant_symbols(
+            symbols=[
+            *declarations,
+            *functions,
+            ],
+            terms=terms,
+        )
 
-        if declarations:
+        if relevant_symbols:
             symbol = ", ".join(
                 [
                     value
                     for value in [
+                        *relevant_symbols,
                         item.symbol,
-                        *declarations,
                     ]
                     if value
                 ]
             )
             compact_content = (
-                "Declarations: "
-                + ", ".join(declarations)
+                "Relevant symbols: "
+                + ", ".join(relevant_symbols)
                 + "\n"
                 + compact_content
             )
@@ -424,6 +734,48 @@ class EvidencePacketBuilder:
 
         return list(
             dict.fromkeys(declarations)
+        )
+
+    def _functions_in_content(
+        self,
+        content: str,
+    ) -> list[str]:
+
+        functions = []
+
+        for match in re.finditer(
+            r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]*)",
+            content,
+        ):
+            functions.append(match.group(1))
+
+        return list(
+            dict.fromkeys(functions)
+        )
+
+    def _rank_relevant_symbols(
+        self,
+        *,
+        symbols: list[str],
+        terms: set[str],
+    ) -> list[str]:
+
+        unique_symbols = list(
+            dict.fromkeys(symbols)
+        )
+
+        return sorted(
+            unique_symbols,
+            key=lambda symbol: (
+                symbol.startswith("Default"),
+                any(
+                    term in symbol.lower()
+                    for term in terms
+                    if len(term) >= 6
+                ),
+                len(symbol),
+            ),
+            reverse=True,
         )
 
     def _compact_file_chunk_content(
@@ -555,31 +907,192 @@ class EvidencePacketBuilder:
                 )
             ]
 
-            return self._diversify_chunks(
+            layer_chunks = (
+                self._select_trace_layer_chunks(
+                    chunks=chunks,
+                    terms=terms,
+                )
+                if self._is_architecture_trace(terms)
+                else []
+            )
+            fill_chunks = self._diversify_chunks(
                 flow_chunks or chunks,
-                limit=self._semantic_top_k(),
-                max_per_file=1,
+                limit=self._semantic_top_k(intent),
+                max_per_file=2,
+            )
+
+            return self._diversify_chunks(
+                layer_chunks + fill_chunks,
+                limit=self._semantic_top_k(intent),
+                max_per_file=2,
             )
 
         return self._diversify_chunks(
             chunks,
-            limit=self._semantic_top_k(),
+            limit=self._semantic_top_k(intent),
             max_per_file=1,
         )
 
-    def _semantic_top_k(self) -> int:
+    def _is_architecture_trace(
+        self,
+        terms: set[str],
+    ) -> bool:
+
+        return bool(
+            terms
+            & {
+                "viewmodel",
+                "usecase",
+                "repository",
+                "datasource",
+            }
+        )
+
+    def _select_trace_layer_chunks(
+        self,
+        *,
+        chunks: list[CodeChunk],
+        terms: set[str],
+    ) -> list[CodeChunk]:
+
+        selected = []
+
+        for markers in [
+            ("viewmodel",),
+            ("usecase", "callasfunction"),
+            ("repository",),
+            ("datasource", "remote"),
+            ("datasource", "cache"),
+            ("api.request",),
+        ]:
+            matches = []
+
+            for chunk in chunks:
+                if self._path_penalty(chunk.source) > 0:
+                    continue
+
+                searchable = self._trace_layer_searchable_text(
+                    chunk=chunk,
+                    include_content=markers == ("api.request",),
+                )
+
+                if all(
+                    marker in searchable
+                    for marker in markers
+                ):
+                    matches.append(chunk)
+
+            if matches:
+                selected.append(
+                    max(
+                        matches,
+                        key=lambda chunk: (
+                            self._trace_layer_match_priority(
+                                chunk=chunk,
+                                markers=markers,
+                                terms=terms,
+                            ),
+                            self._symbol_priority(chunk),
+                            -chunk.start_line,
+                        ),
+                    )
+                )
+
+        return self._deduplicate_chunks(selected)
+
+    def _trace_layer_match_priority(
+        self,
+        *,
+        chunk: CodeChunk,
+        markers: tuple[str, ...],
+        terms: set[str],
+    ) -> int:
+
+        searchable = self._trace_layer_searchable_text(
+            chunk=chunk,
+            include_content=False,
+        )
+        score = 0
+
+        if "default" in searchable:
+            score += 100
+
+        score += sum(
+            30
+            for term in terms
+            if len(term) >= 5 and term in searchable
+        )
+
+        if chunk.symbol_type == "function_declaration":
+            score += 50
+
+        if (
+            markers == ("repository",)
+            and "shared/data/repositories" in searchable
+        ):
+            score += 250
+
+        if (
+            "datasource" in markers
+            and "shared/data/datasources" in searchable
+        ):
+            score += 250
+
+        if (
+            markers == ("viewmodel",)
+            and "presentation/views" in searchable
+        ):
+            score += 100
+
+        if "assembler" in searchable:
+            score -= 120
+
+        if "tests" in searchable:
+            score -= 200
+
+        return score
+
+    def _trace_layer_searchable_text(
+        self,
+        *,
+        chunk: CodeChunk,
+        include_content: bool,
+    ) -> str:
+
+        values = [
+            chunk.source,
+            chunk.symbol or "",
+            chunk.qualified_symbol or "",
+            chunk.parent_symbol or "",
+        ]
+
+        if include_content:
+            values.append(chunk.content)
+
+        return " ".join(
+            value
+            for value in values
+            if value
+        ).lower().replace("_", "")
+
+    def _semantic_top_k(
+        self,
+        intent: str = "general",
+    ) -> int:
 
         configured = int(
             os.environ.get(
                 "SWIFT_AGENT_VECTOR_TOP_K",
-                "6",
+                "10" if intent == "flow_tracing" else "6",
             )
         )
 
         return max(
             1,
             min(
-                self.top_k,
+                max(self.top_k, 10)
+                if intent == "flow_tracing"
+                else self.top_k,
                 configured,
             ),
         )
@@ -1113,6 +1626,16 @@ class EvidencePacketBuilder:
         ).lower()
 
         if self._path_parts(chunk.source) & FLOW_PATH_PARTS:
+            return True
+
+        if (
+            self._trace_layer_boost(
+                chunk=chunk,
+                terms=terms,
+                intent="flow_tracing",
+            )
+            > 0
+        ):
             return True
 
         if "deeplink" in terms and any(

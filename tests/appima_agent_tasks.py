@@ -114,4 +114,155 @@ AGENT_TASKS = [
             ],
         },
     },
+    {
+        "id": "appima_login_flow_trace",
+        "category": "dependency_tracing",
+        "difficulty": "hard",
+        "repository_path": str(APPIMA_REPOSITORY_PATH),
+        "task": (
+            "Analyze the APPIMA login flow from LoginViewModel.login "
+            "until the first external networking calls. Trace every "
+            "internal APPIMA call through the use case, repository, "
+            "remote data source, crypto provider usage, and local "
+            "storage side effects. Include exact file paths and symbol "
+            "names, and stop network tracing at api.request."
+        ),
+        "expected": {
+            "files": [
+                (
+                    "Features/Authentication/Sources/Authentication/"
+                    "Features/Login/Presentation/LoginViewModel.swift"
+                ),
+                (
+                    "Features/Authentication/Sources/Authentication/"
+                    "Features/Login/Domain/UseCases/DoLoginUseCase/"
+                    "DoLoginUseCase.swift"
+                ),
+                (
+                    "Features/Authentication/Sources/Authentication/"
+                    "Features/Login/Data/Repositories/LoginRepository/"
+                    "LoginRepository.swift"
+                ),
+                (
+                    "Features/Authentication/Sources/Authentication/"
+                    "Features/Login/Data/DataSources/"
+                    "LoginRemoteDataSource.swift"
+                ),
+            ],
+            "symbols": [
+                "LoginViewModel",
+                "login",
+                "DefaultDoLoginUseCase",
+                "callAsFunction",
+                "DefaultLoginRepository",
+                "fetchSeed",
+                "beginLogin",
+                "completeLogin",
+                "DefaultLoginRemoteDataSource",
+                "getSeed",
+                "loginResult",
+                "getUserData",
+            ],
+            "must_mention": [
+                "LoginViewModel",
+                "doLoginUseCase",
+                "DefaultDoLoginUseCase",
+                "DefaultLoginRepository",
+                "DefaultLoginRemoteDataSource",
+                "fetchSeed",
+                "beginLogin",
+                "completeLogin",
+                "encryptCredentials",
+                "calculateOTP",
+                "keyValueStorageRepository.save",
+                "api.request",
+            ],
+        },
+    },
+    {
+        "id": "appima_contribution_amount_flow_trace",
+        "category": "dependency_tracing",
+        "difficulty": "hard",
+        "repository_path": str(APPIMA_REPOSITORY_PATH),
+        "task": (
+            "Analyze the ContributionAmountViewModel flow in APPIMA. "
+            "Trace both load() and confirmAmount() through every "
+            "internal APPIMA call until each path reaches the external "
+            "networking boundary. Explain how contribution data, "
+            "promotions, simulation, cache-independent repository calls, "
+            "tracking, and navigation are connected. Include exact file "
+            "paths and symbol names, and stop network tracing at "
+            "api.request."
+        ),
+        "expected": {
+            "files": [
+                (
+                    "Features/Plans/Sources/Plans/Features/"
+                    "Contribution/Presentation/Views/"
+                    "ContributionAmountView/"
+                    "ContributionAmountViewModel.swift"
+                ),
+                (
+                    "Features/Plans/Sources/Plans/Features/"
+                    "Contribution/Domain/UseCases/"
+                    "GetContributionDataUseCase/"
+                    "GetContributionDataUseCase.swift"
+                ),
+                (
+                    "Features/Plans/Sources/Plans/Features/"
+                    "Contribution/Domain/UseCases/"
+                    "GetPromotionsUseCase/GetPromotionsUseCase.swift"
+                ),
+                (
+                    "Features/Plans/Sources/Plans/Features/"
+                    "Contribution/Domain/UseCases/"
+                    "SimulateContributionUseCase/"
+                    "SimulateContributionUseCase.swift"
+                ),
+                (
+                    "Features/Plans/Sources/Plans/Features/"
+                    "Contribution/Data/Repositories/"
+                    "ContributionRepository/"
+                    "ContributionRepository.swift"
+                ),
+                (
+                    "Features/Plans/Sources/Plans/Shared/Data/"
+                    "DataSources/PlansRemoteDataSource/"
+                    "PlansRemoteDataSource.swift"
+                ),
+            ],
+            "symbols": [
+                "ContributionAmountViewModel",
+                "load",
+                "confirmAmount",
+                "DefaultGetContributionDataUseCase",
+                "DefaultGetPromotionsUseCase",
+                "DefaultSimulateContributionUseCase",
+                "DefaultContributionRepository",
+                "getContributionData",
+                "getPromotions",
+                "simulateContribution",
+                "DefaultPlansRemoteDataSource",
+                "fetchContributionData",
+                "fetchPromotions",
+                "simulateContribution",
+            ],
+            "must_mention": [
+                "ContributionAmountViewModel",
+                "load",
+                "confirmAmount",
+                "DefaultGetContributionDataUseCase",
+                "DefaultGetPromotionsUseCase",
+                "DefaultSimulateContributionUseCase",
+                "DefaultContributionRepository",
+                "DefaultPlansRemoteDataSource",
+                "fetchContributionData",
+                "fetchPromotions",
+                "simulateContribution",
+                "trackAmountView",
+                "navigation",
+                "api.request",
+            ],
+        },
+    },
 ]

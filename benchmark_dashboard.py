@@ -303,33 +303,15 @@ HTML = r"""<!doctype html>
               <th>Runs</th>
               <th>Passed</th>
               <th>Pass rate</th>
-              <th>Avg latency</th>
-              <th>Total tokens</th>
-              <th>Input</th>
-              <th>Output</th>
+              <th>Task time</th>
+              <th>Number of tokens used</th>
+              <th>Input tokens</th>
+              <th>Output tokens</th>
               <th>Tool calls</th>
-              <th>Cost</th>
+              <th>Cost of tokens approx.</th>
             </tr>
           </thead>
           <tbody id="aggregateBody"></tbody>
-        </table>
-      </div>
-
-      <div class="panel">
-        <h2>Baseline vs evidence_packet</h2>
-        <div class="small">Uses the visible rows. Negative latency/token deltas mean <code>evidence_packet</code> is better.</div>
-        <table>
-          <thead>
-            <tr>
-              <th>Task</th>
-              <th>Baseline</th>
-              <th>Evidence</th>
-              <th>Latency delta</th>
-              <th>Token delta</th>
-              <th>Missing delta</th>
-            </tr>
-          </thead>
-          <tbody id="comparisonBody"></tbody>
         </table>
       </div>
     </section>
@@ -348,11 +330,14 @@ HTML = r"""<!doctype html>
             <th data-sort="difficulty">Difficulty</th>
             <th data-sort="passed">Passed</th>
             <th data-sort="status">Status</th>
+            <th data-sort="task_time_ms">Task time</th>
             <th data-sort="latency_ms">Latency</th>
+            <th data-sort="evidence_build_ms">Evidence build</th>
             <th data-sort="total_tokens">Tokens</th>
             <th data-sort="input_tokens">Input</th>
             <th data-sort="output_tokens">Output</th>
             <th data-sort="tool_calls">Tools</th>
+            <th data-sort="token_cost">Token cost approx.</th>
             <th data-sort="llm_calls">LLM calls</th>
             <th data-sort="missing_count">Missing</th>
             <th data-sort="evidence_items">Evidence</th>
@@ -395,13 +380,49 @@ HTML = r"""<!doctype html>
     };
 
     const nf = new Intl.NumberFormat();
+    const money = new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: 6
+    });
+    const tokenPricesUsdPerMillion = {
+      "gpt-5-mini": {
+        input: 0.25,
+        output: 2.00
+      }
+    };
 
     function usage(record, key) {
       return Number(record?.usage?.[key] || 0);
     }
 
     function totalTokens(record) {
-      return usage(record, "total_tokens");
+      const total = usage(record, "total_tokens");
+      return total || usage(record, "input_tokens") + usage(record, "output_tokens");
+    }
+
+    function taskTimeMs(record) {
+      const explicit = Number(record.task_time_ms || 0);
+      if (explicit) return explicit;
+      return Number(record.latency_ms || 0)
+        + Number(record.indexed_evidence_build_latency_ms || 0);
+    }
+
+    function tokenCost(record) {
+      const estimated = Number(record?.usage?.estimated_cost || 0);
+      if (estimated) return estimated;
+
+      const recorded = Number(record?.usage?.cost || 0);
+      if (recorded) return recorded;
+
+      const model = record.model || "gpt-5-mini";
+      const prices = tokenPricesUsdPerMillion[model];
+      if (!prices) return 0;
+
+      return (
+        usage(record, "input_tokens") / 1_000_000 * prices.input
+        + usage(record, "output_tokens") / 1_000_000 * prices.output
+      );
     }
 
     function llmCalls(record) {
@@ -432,9 +453,12 @@ HTML = r"""<!doctype html>
       if (key === "total_tokens") return totalTokens(record);
       if (key === "input_tokens") return usage(record, "input_tokens");
       if (key === "output_tokens") return usage(record, "output_tokens");
+      if (key === "task_time_ms") return taskTimeMs(record);
+      if (key === "token_cost") return tokenCost(record);
       if (key === "llm_calls") return llmCalls(record);
       if (key === "missing_count") return missingCount(record);
       if (key === "evidence_items") return evidenceItems(record) + evidenceFacts(record);
+      if (key === "evidence_build_ms") return Number(record.indexed_evidence_build_latency_ms || 0);
       return record[key];
     }
 
@@ -548,16 +572,21 @@ HTML = r"""<!doctype html>
     }
 
     function renderAggregate() {
+      const records = state.visible.filter(r => !r.parse_error);
       const rows = [...groupedBy(
-        state.visible.filter(r => !r.parse_error),
+        records,
         r => r.mode || "unknown"
       ).entries()].sort(([a], [b]) => a.localeCompare(b));
 
       aggregateBody.innerHTML = rows.map(([mode, records]) => {
         const runs = records.length;
         const passed = records.filter(r => r.passed === true).length;
-        const latency = records.reduce((sum, r) => sum + Number(r.latency_ms || 0), 0);
-        const cost = records.reduce((sum, r) => sum + Number(r?.usage?.cost || 0), 0);
+        const modePassRate = passRate(records);
+        const taskTime = records.reduce((sum, r) => sum + taskTimeMs(r), 0);
+        const tokenTotal = records.reduce((sum, r) => sum + totalTokens(r), 0);
+        const inputTokens = records.reduce((sum, r) => sum + usage(r, "input_tokens"), 0);
+        const outputTokens = records.reduce((sum, r) => sum + usage(r, "output_tokens"), 0);
+        const tokenCostTotal = records.reduce((sum, r) => sum + tokenCost(r), 0);
         const tools = records.reduce((sum, r) => sum + Number(r.tool_calls || 0), 0);
 
         return `
@@ -565,16 +594,46 @@ HTML = r"""<!doctype html>
             <td><span class="pill">${escapeHtml(mode)}</span></td>
             <td>${runs}</td>
             <td class="${passed === runs ? "ok" : "warn"}">${passed}/${runs}</td>
-            <td>${runs ? ((passed / runs) * 100).toFixed(1) : "0.0"}%</td>
-            <td>${nf.format(Math.round(latency / Math.max(1, runs)))} ms</td>
-            <td>${nf.format(records.reduce((sum, r) => sum + totalTokens(r), 0))}</td>
-            <td>${nf.format(records.reduce((sum, r) => sum + usage(r, "input_tokens"), 0))}</td>
-            <td>${nf.format(records.reduce((sum, r) => sum + usage(r, "output_tokens"), 0))}</td>
+            <td>${(modePassRate * 100).toFixed(1)}%</td>
+            <td>
+              <strong>${nf.format(taskTime)} ms total</strong>
+              <br><span class="small">${nf.format(Math.round(taskTime / Math.max(1, runs)))} ms avg</span>
+              ${taskTimeList(records)}
+            </td>
+            <td>${nf.format(tokenTotal)}</td>
+            <td>${nf.format(inputTokens)}</td>
+            <td>${nf.format(outputTokens)}</td>
             <td>${nf.format(tools)}</td>
-            <td>${cost.toFixed(4)}</td>
+            <td>${money.format(tokenCostTotal)}</td>
           </tr>
         `;
       }).join("");
+    }
+
+    function passRate(records) {
+      if (!records.length) return 0;
+      return records.filter(r => r.passed === true).length / records.length;
+    }
+
+    function taskTimeList(records) {
+      return records
+        .slice()
+        .sort((a, b) => String(a.task_id || "").localeCompare(String(b.task_id || "")))
+        .map(record => {
+          const agentLatency = Number(record.latency_ms || 0);
+          const buildLatency = record.indexed_evidence_build_latency_ms === null || record.indexed_evidence_build_latency_ms === undefined
+            ? ""
+            : `, build ${nf.format(Number(record.indexed_evidence_build_latency_ms || 0))} ms`;
+
+          return `
+            <div>
+              <code>${escapeHtml(record.task_id || "unknown")}</code>:
+              ${nf.format(taskTimeMs(record))} ms
+              <span class="small">(agent ${nf.format(agentLatency)} ms${buildLatency})</span>
+            </div>
+          `;
+        })
+        .join("");
     }
 
     function renderComparison() {
@@ -584,26 +643,57 @@ HTML = r"""<!doctype html>
 
       for (const [task, taskRecords] of byTask.entries()) {
         const baseline = taskRecords.find(r => r.mode === "baseline");
-        const evidence = taskRecords.find(r => r.mode === "evidence_packet");
+        const chunking = taskRecords.find(r => r.mode === "evidence_packet");
+        const embeddings = taskRecords.find(r => r.mode === "evidence_packet_vector");
 
-        if (!baseline || !evidence) continue;
+        if (!baseline || (!chunking && !embeddings)) continue;
 
-        rows.push({ task, baseline, evidence });
+        rows.push({ task, baseline, chunking, embeddings });
       }
 
       comparisonBody.innerHTML = rows.sort((a, b) => a.task.localeCompare(b.task)).map(row => {
-        const latencyDelta = Number(row.evidence.latency_ms || 0) - Number(row.baseline.latency_ms || 0);
-        const tokenDelta = totalTokens(row.evidence) - totalTokens(row.baseline);
-        const missingDelta = missingCount(row.evidence) - missingCount(row.baseline);
+        const chunkLatencyDelta = row.chunking
+          ? Number(row.chunking.latency_ms || 0) - Number(row.baseline.latency_ms || 0)
+          : null;
+        const embeddingLatencyDelta = row.embeddings
+          ? Number(row.embeddings.latency_ms || 0) - Number(row.baseline.latency_ms || 0)
+          : null;
+        const chunkTokenDelta = row.chunking
+          ? totalTokens(row.chunking) - totalTokens(row.baseline)
+          : null;
+        const embeddingTokenDelta = row.embeddings
+          ? totalTokens(row.embeddings) - totalTokens(row.baseline)
+          : null;
+        const chunkBuild = row.chunking
+          ? Number(row.chunking.indexed_evidence_build_latency_ms || 0)
+          : null;
+        const embeddingBuild = row.embeddings
+          ? Number(row.embeddings.indexed_evidence_build_latency_ms || 0)
+          : null;
+        const chunkMissingDelta = row.chunking
+          ? missingCount(row.chunking) - missingCount(row.baseline)
+          : null;
+        const embeddingMissingDelta = row.embeddings
+          ? missingCount(row.embeddings) - missingCount(row.baseline)
+          : null;
 
         return `
           <tr>
             <td>${escapeHtml(row.task)}</td>
             <td class="${row.baseline.passed ? "ok" : "fail"}">${row.baseline.passed ? "pass" : "fail"}</td>
-            <td class="${row.evidence.passed ? "ok" : "fail"}">${row.evidence.passed ? "pass" : "fail"}</td>
-            <td class="${deltaClass(latencyDelta)}">${formatDelta(latencyDelta)} ms</td>
-            <td class="${deltaClass(tokenDelta)}">${formatDelta(tokenDelta)}</td>
-            <td class="${deltaClass(missingDelta)}">${formatDelta(missingDelta)}</td>
+            ${statusCell(row.chunking)}
+            ${statusCell(row.embeddings)}
+            ${deltaCell(chunkLatencyDelta, " ms")}
+            ${deltaCell(embeddingLatencyDelta, " ms")}
+            ${deltaCell(chunkBuild, " ms")}
+            ${deltaCell(embeddingBuild, " ms")}
+            ${deltaCell(chunkTokenDelta)}
+            ${deltaCell(embeddingTokenDelta)}
+            <td>
+              chunking: ${formatNullableDelta(chunkMissingDelta)}
+              <br>
+              embeddings: ${formatNullableDelta(embeddingMissingDelta)}
+            </td>
           </tr>
         `;
       }).join("");
@@ -616,7 +706,7 @@ HTML = r"""<!doctype html>
             <tr>
               <td></td>
               <td>${escapeHtml(record.source_file || "")}:${record.source_line || ""}</td>
-              <td colspan="14" class="fail">Parse error: ${escapeHtml(record.parse_error)}</td>
+              <td colspan="17" class="fail">Parse error: ${escapeHtml(record.parse_error)}</td>
               <td><pre>${escapeHtml(record.raw_line || "")}</pre></td>
             </tr>
           `;
@@ -635,11 +725,14 @@ HTML = r"""<!doctype html>
             <td>${escapeHtml(record.difficulty || "")}</td>
             <td class="${record.passed ? "ok" : "fail"}">${record.passed === true ? "pass" : "fail"}</td>
             <td>${escapeHtml(record.status || "")}</td>
+            <td>${nf.format(taskTimeMs(record))} ms</td>
             <td>${nf.format(Number(record.latency_ms || 0))} ms</td>
+            <td>${record.indexed_evidence_build_latency_ms === null || record.indexed_evidence_build_latency_ms === undefined ? "n/a" : nf.format(Number(record.indexed_evidence_build_latency_ms || 0)) + " ms"}</td>
             <td>${nf.format(totalTokens(record))}</td>
             <td>${nf.format(usage(record, "input_tokens"))}</td>
             <td>${nf.format(usage(record, "output_tokens"))}</td>
             <td>${nf.format(Number(record.tool_calls || 0))}</td>
+            <td>${money.format(tokenCost(record))}</td>
             <td>${nf.format(llmCalls(record))}</td>
             <td class="${missing ? "fail" : "ok"}">${missing}</td>
             <td>${evidence}</td>
@@ -683,7 +776,6 @@ HTML = r"""<!doctype html>
     function render() {
       renderCards();
       renderAggregate();
-      renderComparison();
       renderRecords();
       renderLogs();
     }
@@ -696,6 +788,20 @@ HTML = r"""<!doctype html>
       if (value < 0) return "negative";
       if (value > 0) return "positive";
       return "neutral";
+    }
+
+    function statusCell(record) {
+      if (!record) return `<td class="neutral">n/a</td>`;
+      return `<td class="${record.passed ? "ok" : "fail"}">${record.passed ? "pass" : "fail"}</td>`;
+    }
+
+    function deltaCell(value, suffix = "") {
+      if (value === null) return `<td class="neutral">n/a</td>`;
+      return `<td class="${deltaClass(value)}">${formatDelta(value)}${suffix}</td>`;
+    }
+
+    function formatNullableDelta(value) {
+      return value === null ? "n/a" : formatDelta(value);
     }
 
     function shortSource(record) {

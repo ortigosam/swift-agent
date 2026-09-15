@@ -64,12 +64,22 @@ ENABLE_LLM_VERIFICATION = False
 BASELINE_MODE = "baseline"
 INDEXED_AGENT_MODE = "indexed_agent"
 INDEXING_MODE = "evidence_packet"
+VECTOR_INDEXING_MODE = "evidence_packet_vector"
+DEFAULT_TOKEN_PRICES_USD_PER_1M = {
+    "gpt-5-mini": {
+        "input": 0.25,
+        "output": 2.00,
+    },
+}
 MODE_ALIASES = {
     "indexed": INDEXED_AGENT_MODE,
     "indexed-agent": INDEXED_AGENT_MODE,
     "indexing": INDEXING_MODE,
     "indexacion": INDEXING_MODE,
     "indexación": INDEXING_MODE,
+    "vector": VECTOR_INDEXING_MODE,
+    "vector-indexing": VECTOR_INDEXING_MODE,
+    "evidence-vector": VECTOR_INDEXING_MODE,
 }
 
 
@@ -86,6 +96,37 @@ def _message_content(message):
         return content
 
     return str(content)
+
+
+def _estimated_token_cost(
+    *,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> float:
+
+    input_price = os.environ.get(
+        "BENCHMARK_INPUT_TOKEN_PRICE_USD_PER_1M"
+    )
+    output_price = os.environ.get(
+        "BENCHMARK_OUTPUT_TOKEN_PRICE_USD_PER_1M"
+    )
+
+    if input_price is None or output_price is None:
+        prices = DEFAULT_TOKEN_PRICES_USD_PER_1M.get(
+            model,
+            {
+                "input": 0.0,
+                "output": 0.0,
+            },
+        )
+        input_price = input_price or str(prices["input"])
+        output_price = output_price or str(prices["output"])
+
+    return (
+        (input_tokens / 1_000_000) * float(input_price)
+        + (output_tokens / 1_000_000) * float(output_price)
+    )
 
 
 def _final_answer(result: dict) -> str:
@@ -452,7 +493,7 @@ async def _run_benchmark(args):
     print(f"BENCHMARK MODEL: {args.model}")
     print(
         "BENCHMARK VECTOR SEARCH: "
-        f"{os.environ.get('SWIFT_AGENT_VECTOR_SEARCH', '') or 'disabled'}"
+        f"{_vector_search_status(modes)}"
     )
     print(
         "BENCHMARK VECTOR DB: "
@@ -489,11 +530,12 @@ async def _run_benchmark(args):
                     create_agent_graph,
                 )
 
-                indexed_evidence = _indexed_evidence_for_mode(
-                    mode=mode,
-                    repository_path=task_repository_path,
-                    task=task_definition["task"],
-                )
+                with _vector_search_environment(mode):
+                    indexed_evidence = _indexed_evidence_for_mode(
+                        mode=mode,
+                        repository_path=task_repository_path,
+                        task=task_definition["task"],
+                    )
                 graph = create_agent_graph(
                     llm,
                     tools,
@@ -548,11 +590,15 @@ def _parse_args():
             BASELINE_MODE,
             INDEXED_AGENT_MODE,
             INDEXING_MODE,
+            VECTOR_INDEXING_MODE,
             "indexed",
             "indexed-agent",
             "indexing",
             "indexacion",
             "indexación",
+            "vector",
+            "vector-indexing",
+            "evidence-vector",
         ],
         help=(
             "Benchmark mode to run. 'indexed_agent' uses the "
@@ -577,6 +623,14 @@ def _parse_args():
             "Run baseline vs evidence_packet comparison. "
             "Both modes use the same Agent; evidence_packet also "
             "injects indexed evidence."
+        ),
+    )
+    parser.add_argument(
+        "--compare-rag",
+        action="store_true",
+        help=(
+            "Run baseline, evidence_packet without embeddings, "
+            "and evidence_packet_vector with embeddings."
         ),
     )
     parser.add_argument(
@@ -645,6 +699,13 @@ def _filter_agent_tasks(
 
 
 def _benchmark_modes(args) -> list[str]:
+
+    if args.compare_rag:
+        return [
+            BASELINE_MODE,
+            INDEXING_MODE,
+            VECTOR_INDEXING_MODE,
+        ]
 
     if args.compare_evidence_packet:
         return [
@@ -743,7 +804,73 @@ def _uses_indexed_evidence(mode: str) -> bool:
     return mode in {
         INDEXED_AGENT_MODE,
         INDEXING_MODE,
+        VECTOR_INDEXING_MODE,
     }
+
+
+def _effective_mode(mode: str) -> str:
+
+    if mode == VECTOR_INDEXING_MODE:
+        return INDEXING_MODE
+
+    return mode
+
+
+class _vector_search_environment:
+
+    def __init__(
+        self,
+        mode: str,
+    ):
+        self.mode = mode
+        self.previous = os.environ.get(
+            "SWIFT_AGENT_VECTOR_SEARCH"
+        )
+
+    def __enter__(self):
+
+        if self.mode == VECTOR_INDEXING_MODE:
+            os.environ["SWIFT_AGENT_VECTOR_SEARCH"] = "1"
+        elif self.mode == INDEXING_MODE:
+            os.environ.pop(
+                "SWIFT_AGENT_VECTOR_SEARCH",
+                None,
+            )
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
+
+        if self.previous is None:
+            os.environ.pop(
+                "SWIFT_AGENT_VECTOR_SEARCH",
+                None,
+            )
+            return
+
+        os.environ["SWIFT_AGENT_VECTOR_SEARCH"] = self.previous
+
+
+def _mode_uses_vector_search(mode: str) -> bool:
+
+    return mode == VECTOR_INDEXING_MODE
+
+
+def _vector_search_status(modes: list[str]) -> str:
+
+    if VECTOR_INDEXING_MODE in modes:
+        return (
+            "enabled for "
+            f"{VECTOR_INDEXING_MODE}"
+        )
+
+    return os.environ.get(
+        "SWIFT_AGENT_VECTOR_SEARCH",
+        "",
+    ) or "disabled"
 
 
 def _load_agent_tasks(
@@ -817,6 +944,24 @@ async def _run_task(
     )
     usage = llm.get_usage()
     invocations = llm.get_invocations()
+    input_tokens = usage["input_tokens"]
+    output_tokens = usage["output_tokens"]
+    total_tokens = input_tokens + output_tokens
+    estimated_token_cost = _estimated_token_cost(
+        model=llm.model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    evidence_build_latency_ms = (
+        indexed_evidence.build_latency_ms
+        if indexed_evidence is not None
+        else 0
+    )
+    agent_latency_ms = int(elapsed * 1000)
+    task_time_ms = (
+        agent_latency_ms
+        + evidence_build_latency_ms
+    )
     answer = _final_answer(result)
     evaluation = _evaluate_answer(
         answer=answer,
@@ -852,20 +997,19 @@ async def _run_task(
         ),
         "passed": evaluation["passed"],
         "evaluation": evaluation,
-        "latency_ms": int(elapsed * 1000),
+        "model": llm.model,
+        "latency_ms": agent_latency_ms,
+        "agent_latency_ms": agent_latency_ms,
+        "task_time_ms": task_time_ms,
         "iterations": result["iteration"],
         "tool_calls": result["tool_calls"],
         "usage": {
-            "input_tokens": usage[
-                "input_tokens"
-            ],
-            "output_tokens": usage[
-                "output_tokens"
-            ],
-            "total_tokens": usage[
-                "total_tokens"
-            ],
-            "cost": usage["cost"],
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cost": estimated_token_cost,
+            "estimated_cost": estimated_token_cost,
+            "sdk_reported_cost": usage["cost"],
         },
         "evidence_packet": (
             indexed_evidence.packet.to_dict()
@@ -878,15 +1022,7 @@ async def _run_task(
             else None
         ),
         "vector_search_enabled": (
-            os.environ.get(
-                "SWIFT_AGENT_VECTOR_SEARCH",
-                "",
-            ).lower()
-            in {
-                "1",
-                "true",
-                "yes",
-            }
+            _mode_uses_vector_search(mode)
         ),
         "vector_database_path": os.environ.get(
             "SWIFT_AGENT_VECTOR_DB_PATH"

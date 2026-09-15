@@ -140,6 +140,25 @@ class Agent:
         tool_history = self._compact_tool_history(
             context.tool_history
         )
+        important_instructions = (
+            "Use the indexed repository evidence above as the "
+            "repository inspection result. Do not claim that "
+            "repository search access is missing when indexed "
+            "evidence is present. When the task asks for exact "
+            "paths or symbols, cite the file and symbol metadata "
+            "from the evidence verbatim. Do not replace concrete "
+            "implementation symbols with broader protocol, parent, "
+            "or assembler names. If a checklist item contains "
+            "multiple symbols, preserve the concrete Default*, "
+            "function, Repository, DataSource, UseCase, and "
+            "ViewModel symbols that are relevant to the task."
+            if self.indexed_evidence
+            else (
+                "Use only the repository tools listed above when "
+                "repository evidence is required.\n\n"
+                "Do not guess when the repository can be inspected."
+            )
+        )
 
         prompt = f"""
 {self.system_prompt}
@@ -174,9 +193,6 @@ class Agent:
 
 IMPORTANT:
 
-Use only the repository tools listed above when repository
-evidence is required.
-
-Do not guess when the repository can be inspected.
+{important_instructions}
 """
         return prompt

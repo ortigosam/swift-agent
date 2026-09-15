@@ -78,6 +78,31 @@ class EvidencePacket:
                 )
             )
 
+        if self.items:
+            sections.append(
+                "\n".join(
+                    [
+                        "## Evidence checklist",
+                        *[
+                            (
+                                f"- {item.file}"
+                                + (
+                                    f" | Symbol: {item.symbol}"
+                                    if item.symbol
+                                    else ""
+                                )
+                                + (
+                                    f" | Context: {item.context_path}"
+                                    if item.context_path
+                                    else ""
+                                )
+                            )
+                            for item in self.items
+                        ],
+                    ]
+                )
+            )
+
         for index, item in enumerate(
             self.items,
             start=1,
